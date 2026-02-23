@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use serde_json::Value;
 
-use crate::app::{App, DetailPaneMode, FocusPane, InputMode};
+use crate::app::{App, DetailPaneMode, InputMode, TableOverlayKind};
 use crate::model::{ResourceTab, RowData};
 
 const BG: Color = Color::Rgb(9, 15, 25);
@@ -75,7 +75,28 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 fn build_left_header_line(app: &App) -> Line<'static> {
     let group = tab_group_label(app.active_tab());
     let group_icon = tab_group_icon(app.active_tab());
-    let active_resource = if app.active_tab() == ResourceTab::CustomResources {
+    let active_resource = if app.container_picker_active() {
+        format!(
+            "{} {}  {} {}",
+            group_icon,
+            compact_text(group, 10),
+            "󰞷",
+            "containers"
+        )
+    } else if app.table_overlay_active() {
+        let (icon, label) = match app.table_overlay_kind() {
+            Some(TableOverlayKind::PodLogs) => ("󰍩", "logs"),
+            Some(TableOverlayKind::RelatedLogs) => ("󰌨", "logs"),
+            _ => (tab_icon(app.active_tab()), "output"),
+        };
+        format!(
+            "{} {}  {} {}",
+            group_icon,
+            compact_text(group, 10),
+            icon,
+            compact_text(label, 14),
+        )
+    } else if app.active_tab() == ResourceTab::CustomResources {
         app.selected_custom_resource()
             .map(|crd| {
                 format!(
@@ -1105,13 +1126,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         );
         push_powerline_segment(
             &mut spans,
-            format!(
-                " 󱂬 {} ",
-                match app.focus() {
-                    FocusPane::Table => "tbl",
-                    FocusPane::Detail => "det",
-                }
-            ),
+            format!(" 󱂬 {} ", app.pane_label()),
             Color::White,
             PL_D,
             BG,

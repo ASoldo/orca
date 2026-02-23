@@ -25,6 +25,13 @@ pub enum DetailPaneMode {
     Details,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TableOverlayKind {
+    Generic,
+    PodLogs,
+    RelatedLogs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     None,
@@ -132,6 +139,8 @@ struct ViewState {
     selected_crd: Option<String>,
     table_overlay: Option<String>,
     table_overlay_title: Option<String>,
+    table_overlay_kind: TableOverlayKind,
+    table_overlay_return_picker: Option<ContainerPickerState>,
     table_scroll: u16,
     detail_overlay: Option<String>,
     detail_overlay_title: Option<String>,
@@ -161,6 +170,8 @@ pub struct App {
     user: String,
     table_overlay: Option<String>,
     table_overlay_title: Option<String>,
+    table_overlay_kind: TableOverlayKind,
+    table_overlay_return_picker: Option<ContainerPickerState>,
     show_table_overview: bool,
     table_scroll: u16,
     detail_overlay: Option<String>,
@@ -208,6 +219,8 @@ impl App {
             selected_crd: None,
             table_overlay: None,
             table_overlay_title: None,
+            table_overlay_kind: TableOverlayKind::Generic,
+            table_overlay_return_picker: None,
             table_scroll: 0,
             detail_overlay: None,
             detail_overlay_title: None,
@@ -237,6 +250,8 @@ impl App {
             user: "-".to_string(),
             table_overlay: None,
             table_overlay_title: None,
+            table_overlay_kind: TableOverlayKind::Generic,
+            table_overlay_return_picker: None,
             show_table_overview: false,
             table_scroll: 0,
             detail_overlay: None,
@@ -266,10 +281,6 @@ impl App {
 
     pub fn mode(&self) -> InputMode {
         self.mode
-    }
-
-    pub fn focus(&self) -> FocusPane {
-        self.focus
     }
 
     pub fn detail_mode(&self) -> DetailPaneMode {
@@ -374,8 +385,35 @@ impl App {
         self.table_overlay.is_some()
     }
 
+    pub fn table_overlay_kind(&self) -> Option<TableOverlayKind> {
+        self.table_overlay.as_ref().map(|_| self.table_overlay_kind)
+    }
+
     pub fn container_picker_active(&self) -> bool {
         self.container_picker.is_some()
+    }
+
+    pub fn pane_label(&self) -> &'static str {
+        if self.container_picker_active() {
+            return "ctr";
+        }
+        if self.table_overlay_active() {
+            return match self.table_overlay_kind {
+                TableOverlayKind::PodLogs => "log",
+                TableOverlayKind::RelatedLogs => "LOG",
+                TableOverlayKind::Generic => "out",
+            };
+        }
+        if self.show_table_overview {
+            return "ovr";
+        }
+        if self.detail_mode == DetailPaneMode::Details {
+            return "det";
+        }
+        match self.focus {
+            FocusPane::Table => "tbl",
+            FocusPane::Detail => "det",
+        }
     }
 
     pub fn table_overview_active(&self) -> bool {
@@ -665,9 +703,24 @@ impl App {
         self.detail_overlay.is_some()
     }
 
-    pub fn set_table_overlay(&mut self, title: impl Into<String>, detail: String) {
+    pub fn set_pod_logs_overlay(&mut self, title: impl Into<String>, detail: String) {
+        self.set_table_overlay_with_kind(title, detail, TableOverlayKind::PodLogs);
+    }
+
+    pub fn set_related_logs_overlay(&mut self, title: impl Into<String>, detail: String) {
+        self.set_table_overlay_with_kind(title, detail, TableOverlayKind::RelatedLogs);
+    }
+
+    fn set_table_overlay_with_kind(
+        &mut self,
+        title: impl Into<String>,
+        detail: String,
+        kind: TableOverlayKind,
+    ) {
         self.table_overlay_title = Some(title.into());
         self.table_overlay = Some(detail);
+        self.table_overlay_kind = kind;
+        self.table_overlay_return_picker = self.container_picker.clone();
         self.container_picker = None;
         self.show_table_overview = false;
         self.table_scroll = 0;
@@ -882,8 +935,14 @@ impl App {
                     self.container_picker = None;
                     self.status = "Closed container list".to_string();
                 } else if self.table_overlay_active() {
-                    self.clear_table_overlay();
-                    self.status = "Closed logs view".to_string();
+                    if let Some(previous_picker) = self.table_overlay_return_picker.clone() {
+                        self.clear_table_overlay();
+                        self.container_picker = Some(previous_picker);
+                        self.status = "Back to container list".to_string();
+                    } else {
+                        self.clear_table_overlay();
+                        self.status = "Closed logs view".to_string();
+                    }
                 } else if self.show_table_overview {
                     self.show_table_overview = false;
                     self.status = "Closed overview".to_string();
@@ -1151,6 +1210,8 @@ impl App {
             selected_crd: self.selected_crd.clone(),
             table_overlay: self.table_overlay.clone(),
             table_overlay_title: self.table_overlay_title.clone(),
+            table_overlay_kind: self.table_overlay_kind,
+            table_overlay_return_picker: self.table_overlay_return_picker.clone(),
             table_scroll: self.table_scroll,
             detail_overlay: self.detail_overlay.clone(),
             detail_overlay_title: self.detail_overlay_title.clone(),
@@ -1172,6 +1233,8 @@ impl App {
         self.selected_crd = state.selected_crd.clone();
         self.table_overlay = state.table_overlay.clone();
         self.table_overlay_title = state.table_overlay_title.clone();
+        self.table_overlay_kind = state.table_overlay_kind;
+        self.table_overlay_return_picker = state.table_overlay_return_picker.clone();
         self.table_scroll = state.table_scroll;
         self.detail_overlay = state.detail_overlay.clone();
         self.detail_overlay_title = state.detail_overlay_title.clone();
@@ -1211,6 +1274,8 @@ impl App {
             state.show_table_overview = false;
             state.table_overlay = None;
             state.table_overlay_title = None;
+            state.table_overlay_kind = TableOverlayKind::Generic;
+            state.table_overlay_return_picker = None;
             state.table_scroll = 0;
             state.detail_overlay = None;
             state.detail_overlay_title = None;
@@ -2376,6 +2441,8 @@ impl App {
     fn clear_table_overlay(&mut self) {
         self.table_overlay_title = None;
         self.table_overlay = None;
+        self.table_overlay_kind = TableOverlayKind::Generic;
+        self.table_overlay_return_picker = None;
         self.table_scroll = 0;
     }
 
@@ -2665,7 +2732,7 @@ fn normalize_status_text(status: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppCommand, DetailPaneMode, FocusPane, normalize_mode_prefixed_input};
+    use super::{App, AppCommand, DetailPaneMode, normalize_mode_prefixed_input};
     use crate::input::Action;
     use crate::model::{NamespaceScope, ResourceTab, RowData, TableData};
     use chrono::Local;
@@ -2977,11 +3044,60 @@ mod tests {
 
         let _ = app.apply_action(Action::ShowDetails);
         assert_eq!(app.detail_mode(), DetailPaneMode::Details);
-        assert_eq!(app.focus(), FocusPane::Detail);
+        assert_eq!(app.pane_label(), "det");
 
         let _ = app.apply_action(Action::ClearDetailOverlay);
         assert_eq!(app.detail_mode(), DetailPaneMode::Dashboard);
-        assert_eq!(app.focus(), FocusPane::Table);
+        assert_eq!(app.pane_label(), "tbl");
+    }
+
+    #[test]
+    fn esc_from_container_logs_returns_to_container_picker_first() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut data = TableData::default();
+        data.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "pod-1".to_string(),
+                namespace: Some("default".to_string()),
+                columns: vec!["pod-1".to_string()],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Pods, data);
+        app.set_container_picker("default", "pod-1", vec!["c1".to_string()]);
+        assert!(app.container_picker_active());
+
+        app.set_pod_logs_overlay("Pod Logs default/pod-1:c1", "line".to_string());
+        assert!(app.table_overlay_active());
+        assert!(!app.container_picker_active());
+        assert_eq!(app.pane_label(), "log");
+
+        let _ = app.apply_action(Action::ClearDetailOverlay);
+        assert!(app.container_picker_active());
+        assert!(!app.table_overlay_active());
+        assert_eq!(app.pane_label(), "ctr");
+
+        let _ = app.apply_action(Action::ClearDetailOverlay);
+        assert!(!app.container_picker_active());
+        assert_eq!(app.pane_label(), "tbl");
+    }
+
+    #[test]
+    fn pane_label_uses_uppercase_for_related_logs() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_related_logs_overlay("Logs default/pod-1", "line".to_string());
+        assert_eq!(app.pane_label(), "LOG");
     }
 
     #[test]

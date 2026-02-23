@@ -318,7 +318,7 @@ async fn execute_app_command(
                     (None, true) => format!("Pod Logs (previous) {namespace}/{pod_name}"),
                     (None, false) => format!("Pod Logs {namespace}/{pod_name}"),
                 };
-                app.set_table_overlay(title, logs);
+                app.set_pod_logs_overlay(title, logs);
                 app.set_status(format!("Loaded logs for {namespace}/{pod_name}"));
             }
             Err(error) => {
@@ -362,7 +362,7 @@ async fn execute_app_command(
                         }
                         (None, false) => format!("Logs {}/{}", target.namespace, target.pod_name),
                     };
-                    app.set_table_overlay(title, logs);
+                    app.set_related_logs_overlay(title, logs);
                     app.set_status(format!(
                         "Loaded related logs via {} for {}/{}",
                         target.source, target.namespace, target.pod_name
