@@ -1,114 +1,194 @@
 # orca
 
-`orca` is a modern Kubernetes terminal cockpit inspired by `k9s`, rebuilt in Rust with `ratatui`.
+`orca` is a Kubernetes terminal cockpit inspired by `k9s`, built in Rust with `ratatui`.
 
-## Highlights
+## Current capabilities
 
-- Fast async runtime (`tokio`) and typed Kubernetes client (`kube` + `k8s-openapi`)
-- Responsive layout for wide, medium, and small terminal sizes
-- Vim-style navigation and command workflow
-- Powerline-inspired top/status bars for dense terminal context
-- Compact icon-based top bar with active resource context
-- Dashboard side pane (gauges + health map) tied to current selection
-- Multi-resource exploration:
-  - Workloads: CronJobs, DaemonSets, Deployments, Jobs, Pods, ReplicaSets, ReplicationControllers, StatefulSets
-  - Service: Ingresses, IngressClasses, Services
-  - Config & Storage: ConfigMaps, PersistentVolumeClaims, Secrets, StorageClasses, PersistentVolumes
-  - Cluster & RBAC: ClusterRoleBindings, ClusterRoles, Events, Namespaces, NetworkPolicies, Nodes, RoleBindings, Roles, ServiceAccounts
-  - Custom Resource Definitions catalog (`CRD`)
-- Full short/long aliases in `:` / `>` commands (kubectl-style): `po|pods`, `cj|cronjobs`, `ds|daemonsets`, `rs`, `rc`, `ing`, `cm`, `pvc`, `sa`, `rb`, `crb`, `np`, `sc`, `pv`, `ns`, `crd`, ...
-- Watch streams for all built-in mapped resources
-- YAML detail mode + compact dashboard overview mode
-- Dashboard widgets: status bars, readiness/stability gauges, load/risk trends
-- On-demand YAML detail pane for selected resources (`Enter`/`d`, `Esc` to return)
-- Pod log loading (`l` or `:logs`) in the details pane
-- Namespace scope switching (`--namespace`, `--all-namespaces`, `:ns`, `:all-ns`)
-- Context and cluster switching (`:ctx`, `:cluster`, `> ctx`, `> cluster`)
-- Watch-driven live refresh for active resources (with polling fallback)
-- DevOps actions:
-  - `:delete` (with confirmation)
-  - `:restart` (Deployments/StatefulSets, with confirmation)
-  - `:scale <replicas>` (Deployments/StatefulSets, with confirmation)
-  - `:exec <cmd...>` (selected pod)
-  - `:shell` / `:ssh` / `:bash` (interactive shell in selected pod)
-  - `:edit` (opens selected resource in your editor)
-  - `:port-forward <local>:<remote>` (selected pod/service)
-  - Live port-forward indicator in Pods/Services (`PF` column + top badge on selected row)
+- Async TUI runtime with `tokio` + typed Kubernetes client (`kube`, `k8s-openapi`)
+- Powerline-style header/footer with compact context, scope, and status data
+- Multi-view workflow (view slots) for fast context switching without losing state
+- Vim-style navigation and command/jump/filter modes
+- Single main pane that can show:
+  - resource table
+  - dashboard overview (`o`)
+  - syntax-highlighted details (`d`)
+  - logs/output overlay
+  - pod container picker
+- Watch-based refresh for mapped resources, with periodic refresh fallback
+- Context, cluster, and user switching from kubeconfig
+- Namespace scoping (`--namespace`, `--all-namespaces`, `:ns`, `:all-ns`)
+- Pod/service port-forward management with live PF indicators
+- YAML/JSON syntax highlighting in details view
+
+## Supported resources
+
+- Pods
+- CronJobs
+- DaemonSets
+- Deployments
+- ReplicaSets
+- ReplicationControllers
+- StatefulSets
+- Jobs
+- Services
+- Ingresses
+- IngressClasses
+- ConfigMaps
+- PersistentVolumeClaims
+- Secrets
+- StorageClasses
+- PersistentVolumes
+- ServiceAccounts
+- Roles
+- RoleBindings
+- ClusterRoles
+- ClusterRoleBindings
+- NetworkPolicies
+- Nodes
+- Events
+- Namespaces
+- CRD (custom resources + CRD catalog)
+
+## Requirements
+
+- Access to a Kubernetes cluster (`$KUBECONFIG` or in-cluster config)
+- `kubectl` in `PATH` for subprocess actions:
+  - `:exec`
+  - `:shell` / `:ssh` / `:bash`
+  - `:edit`
+  - `:port-forward`
+- Optional but recommended: `metrics-server` for richer CPU/RAM dashboard data
+
+`orca` uses `$KUBE_EDITOR` for `:edit`; if unset, it forwards `$EDITOR` to `kubectl`.
 
 ## Run
 
 ```bash
-cargo run -- --all-namespaces
+cargo run --release -- --all-namespaces
 ```
-
-or
 
 ```bash
-cargo run -- --namespace default --refresh-ms 1500
+cargo run --release -- --namespace default --refresh-ms 1500
 ```
 
-`kubectl` must be available in `PATH` for `:exec`, `:shell`, `:edit`, and `:port-forward`.
-`$KUBE_EDITOR` is respected for `:edit`; if unset, `orca` forwards `$EDITOR` to `kubectl`.
+## CLI flags
+
+- `--refresh-ms <ms>`: refresh interval in milliseconds (minimum enforced at runtime: `500`)
+- `-n, --namespace <name>`: start in a specific namespace
+- `-A, --all-namespaces`: start with all namespaces
+- `--log-filter <level>`: tracing filter (default: `info`)
+
+## Interaction model
+
+- `Enter` is drill-down, not details:
+  - `Namespaces -> Pods` (sets namespace scope)
+  - `Pods -> Containers` (container picker)
+  - `Deployments/DaemonSets/StatefulSets/ReplicaSets/ReplicationControllers/Jobs/CronJobs -> Pods`
+  - `Services -> Pods`
+- `d` opens details mode for the selected row
+- `Esc` goes back one step (logs -> containers -> previous flow/root)
+- `o` toggles overview dashboard in the main pane
 
 ## Keybindings
 
 - `Left` / `Right`: previous/next resource tab
-- `j` / `k`: move selection
-- `gg` / `G`: first/last row
-- `Ctrl+u` / `Ctrl+d`: jump up/down
+- `j` / `k`, `Up` / `Down`: move selection
+- `gg` / `G`: top / bottom
+- `Ctrl+u` / `Ctrl+d`, `PageUp` / `PageDown`: page scroll
 - `/`: filter mode
 - `:`: command mode
-- `>`: jump mode (quick tab/resource jump)
-- `Tab`: autocomplete in `:` and `>` modes
-- `Up`/`Down` or `Ctrl+p`/`Ctrl+n`: cycle autocomplete suggestions
-- `r`: refresh active tab
-- `l`: load logs for selected pod
-- `s`: open shell in selected pod
+- `>`: jump mode
+- `Tab` (input modes): autocomplete
+- `Up` / `Down` or `Ctrl+p` / `Ctrl+n` (input modes): autocomplete selection
+- `Enter` (or terminal fallbacks `Ctrl+m` / `Ctrl+j` in input mode): submit input
+- `l`: logs for selected pod/container
+- `Shift+L`: previous/related logs (workload/service aware)
+- `s`: open shell (`/bin/sh`) in selected pod
 - `e`: edit selected resource
-- `p`: open `:port-forward ` prompt
-- `Enter` or `d`: open selected resource details
-- `Esc`: return from details pane to dashboard
-- `Tab` (normal mode): toggle table/detail focus
-- `y` / `n`: confirm/cancel pending actions
-- `?`: toggle help
+- `p`: prefill `:port-forward ` command
+- `d`: open details view
+- `o`: open/close overview
+- `Tab` (normal mode): toggle focus (`table`/`details` when details mode is active)
+- `y` / `n`: confirm or cancel pending actions
+- `?`: help modal
 - `q`: quit
 
-## Commands
+### View slots
+
+- `Ctrl+0..9` switches/creates view slots
+- `0..9` also switches view slots in normal mode
+- `Alt+0..9` switches view slots in input modes
+- View state is preserved per slot (tab, scope, filter, overlays, selection)
+
+## Command mode (`:`)
+
+Supported commands:
 
 - `:q`, `:quit`, `:exit`
-- `:refresh`
-- `:ctx <context-name>`
-- `:cluster <cluster-name|cluster-server>`
-- `:ns` (switch to Namespaces tab)
+- `:refresh` (`:reload`, `:r`)
+- `:ctx <context>` (`:context`, `:use-context`)
+- `:cluster <cluster-name-or-server>` (`:cl`)
+- `:user <user>` (`:usr`)
+- `:contexts`, `:clusters`, `:users`
+- `:all-ns` (`:all`, `:allns`, `:all-namespaces`)
+- `:ns` / `:namespace` / `:namespaces`
 - `:ns <namespace>`
-- `:namespace` / `:namespaces` (same behavior as `:ns`)
-- `:all-ns`
-- `:<resource>` (direct tab switch using short/long names: `po`, `pods`, `deployments`, `svc`, `events`, `ns`, `crd`, ...)
-- `:<resource> <query>` (switch tab and apply filter)
-- `:tab <pods|deployments|statefulsets|jobs|services|nodes|events|namespaces>`
-- `:tab <pods|deployments|statefulsets|jobs|services|nodes|events|namespaces|crd>`
+- `:<resource>` (switch tab by alias)
+- `:<resource> <filter>`
+- `:<resource> <namespace>/<name>`
 - `:filter <query>`
 - `:clear`
 - `:logs`
-- `:edit`
-- `:delete`
-- `:restart`
-- `:scale <replicas>`
-- `:exec <command...>`
+- `:edit` (`:e`)
+- `:delete` (`:del`) (confirmation required)
+- `:restart` (Deployments/StatefulSets, confirmation required)
+- `:scale <replicas>` (Deployments/StatefulSets, immediate)
+- `:exec <command...>` (Pods tab)
 - `:shell [container] [shell]`
 - `:ssh [container] [shell]`
 - `:bash`
-- `:port-forward <local>:<remote>`
-- `:crd <name|kind|plural>`
+- `:pf <local>:<remote>` (`:port-forward`)
+- `:crd <name|kind|plural>` (`:custom`)
 - `:crd-refresh`
 - `:help`
 
-## Architecture
+Compatibility command:
 
-- `src/main.rs`: app runtime, event loop, refresh scheduling
-- `src/app.rs`: state machine, commands, interaction model
-- `src/input.rs`: key mapping and mode-specific actions
-- `src/k8s.rs`: Kubernetes data fetchers and pod logs API
-- `src/ui.rs`: responsive `ratatui` rendering
-- `src/model.rs`: shared domain models
-- `src/cli.rs`: CLI arguments
+- `:tab <resource> [filter-or-target]`
+
+## Jump mode (`>`)
+
+- Supports the same context/cluster/user and resource aliases for fast navigation
+- Supports namespaced targets (for example `>po my-ns/my-pod`)
+- Supports fuzzy jump by resource name/namespace when no explicit alias is provided
+- Resets to the current flow root before executing jump selection
+
+## Resource aliases
+
+Short aliases accepted in `:` and `>` include:
+
+- `po`, `cj`, `ds`, `deploy`, `rs`, `rc`, `sts`, `job`
+- `svc`, `ing`, `ingclass`, `cm`, `pvc`, `secret`, `sc`, `pv`
+- `sa`, `role`, `rb`, `crole`, `crb`, `np`, `node`, `event`, `ns`, `crd`
+
+Long names (`pods`, `deployments`, `services`, etc.) are also supported.
+
+## DevOps actions behavior
+
+- `:delete` and `:restart` are guarded by confirmation (`y/n`, `Enter` also confirms)
+- `:scale` executes immediately and refreshes the active resource table
+- `l`/`:logs` are pod/container log focused
+- `Shift+L` resolves related pod logs for workload/service resources
+- Port-forward sessions are tracked and shown in:
+  - `PF` table column for Pods/Services
+  - header badge for selected resource
+
+## Project layout
+
+- `src/main.rs`: runtime loop, event handling, refresh/watch orchestration
+- `src/app.rs`: state machine, mode handling, command parser, drill-down flow
+- `src/input.rs`: key mapping by mode
+- `src/k8s.rs`: Kubernetes API gateway, table builders, actions, metrics, discovery
+- `src/ui.rs`: `ratatui` rendering, powerline bars, dashboard, syntax highlighting
+- `src/model.rs`: shared tab/data models
+- `src/cli.rs`: CLI argument definitions
