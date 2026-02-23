@@ -3,6 +3,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
+use serde_json::Value;
 
 use crate::app::{App, DetailPaneMode, FocusPane, InputMode};
 use crate::model::{ResourceTab, RowData};
@@ -106,28 +107,35 @@ fn build_left_header_line(app: &App) -> Line<'static> {
     };
 
     let mut spans = Vec::new();
-    let cluster_value = compact_text(&display_cluster_endpoint(app.cluster()), 30);
+    let cluster_value = compact_text(&display_cluster_endpoint(app.cluster()), 26);
     push_powerline_segment(&mut spans, " ORCA ", Color::Black, ACCENT, PL_A);
     push_powerline_segment(
         &mut spans,
-        format!(" 󰠳 {} ", cluster_value),
+        format!(" 󰀄 {} ", compact_text(app.user(), 14)),
         Color::White,
         PL_A,
         PL_B,
     );
     push_powerline_segment(
         &mut spans,
-        format!(" 󱃾 {} ", compact_text(app.context(), 14)),
+        format!(" 󰠳 {} ", cluster_value),
         Color::White,
         PL_B,
         PL_C,
     );
     push_powerline_segment(
         &mut spans,
-        format!(" 󰉖 {} ", compact_text(&app.namespace_scope().label(), 12)),
+        format!(" 󱃾 {} ", compact_text(app.context(), 14)),
         Color::White,
         PL_C,
         PL_D,
+    );
+    push_powerline_segment(
+        &mut spans,
+        format!(" 󰉖 {} ", compact_text(&app.namespace_scope().label(), 12)),
+        Color::White,
+        PL_D,
+        Color::Rgb(88, 28, 135),
     );
     push_powerline_segment(
         &mut spans,
@@ -143,7 +151,7 @@ fn build_left_header_line(app: &App) -> Line<'static> {
             )
         ),
         Color::White,
-        PL_D,
+        Color::Rgb(88, 28, 135),
         Color::Rgb(88, 28, 135),
     );
     if let Some(port_forward) = app.port_forward_badge() {
@@ -215,6 +223,11 @@ fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_table(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    if app.container_picker_active() {
+        render_container_picker(frame, area, app, focused);
+        return;
+    }
+
     if app.table_overlay_active() {
         let title = app
             .table_overlay_title()
@@ -322,13 +335,55 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     frame.render_stateful_widget(table, area, &mut state);
 }
 
+fn render_container_picker(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let title = app
+        .container_picker_title()
+        .unwrap_or_else(|| "Containers".to_string());
+    let items = app.container_picker_items();
+    let header = Row::new(vec![
+        Cell::from("Container".to_string()).style(Style::default().add_modifier(Modifier::BOLD)),
+    ])
+    .height(1)
+    .style(Style::default().fg(ACCENT));
+    let rows = items.iter().map(|item| {
+        Row::new(vec![
+            Cell::from(item.clone()).style(Style::default().fg(Color::White)),
+        ])
+    });
+
+    let block = Block::default()
+        .title(format!("{title} ({})", items.len()))
+        .borders(Borders::ALL)
+        .border_style(if focused {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(MUTED)
+        })
+        .style(Style::default().bg(PANEL));
+
+    let table = Table::new(rows, vec![Constraint::Percentage(100)])
+        .header(header)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(24, 36, 58))
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("󰜴 ");
+
+    let mut state = TableState::default();
+    state.select(app.container_picker_selected_index());
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     let title = app.detail_title();
     let detail = app.detail_text();
     let text = if app.detail_overlay_active() {
         Text::from(detail)
     } else {
-        highlight_yaml_text(&detail)
+        highlight_structured_text(&detail)
     };
     let block = Block::default()
         .title(title)
@@ -1260,6 +1315,124 @@ fn footer_status_icon(status_text: &str) -> &'static str {
     if has_failure { "󰅚" } else { "󰄬" }
 }
 
+fn highlight_structured_text(input: &str) -> Text<'static> {
+    let trimmed = input.trim_start();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && serde_json::from_str::<Value>(trimmed).is_ok()
+    {
+        return highlight_json_text(trimmed);
+    }
+    highlight_yaml_text(input)
+}
+
+fn highlight_json_text(input: &str) -> Text<'static> {
+    let pretty = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| input.to_string());
+    let lines = pretty
+        .lines()
+        .map(highlight_json_line)
+        .collect::<Vec<Line<'static>>>();
+    Text::from(lines)
+}
+
+fn highlight_json_line(line: &str) -> Line<'static> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut spans = Vec::new();
+
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_ascii_whitespace() {
+            spans.push(Span::raw(ch.to_string()));
+            index += 1;
+            continue;
+        }
+
+        if matches!(ch, '{' | '}' | '[' | ']' | ':' | ',') {
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(MUTED)));
+            index += 1;
+            continue;
+        }
+
+        if ch == '"' {
+            let (token, next_index) = read_json_string(&chars, index);
+            let mut look_ahead = next_index;
+            while look_ahead < chars.len() && chars[look_ahead].is_ascii_whitespace() {
+                look_ahead += 1;
+            }
+            let color = if look_ahead < chars.len() && chars[look_ahead] == ':' {
+                Color::Rgb(103, 232, 249)
+            } else {
+                Color::Rgb(125, 211, 252)
+            };
+            spans.push(Span::styled(token, Style::default().fg(color)));
+            index = next_index;
+            continue;
+        }
+
+        if ch.is_ascii_digit() || ch == '-' {
+            let start = index;
+            while index < chars.len()
+                && (chars[index].is_ascii_digit()
+                    || matches!(chars[index], '-' | '+' | '.' | 'e' | 'E'))
+            {
+                index += 1;
+            }
+            spans.push(Span::styled(
+                chars[start..index].iter().collect::<String>(),
+                Style::default().fg(Color::Rgb(251, 146, 60)),
+            ));
+            continue;
+        }
+
+        if chars[index..].starts_with(&['t', 'r', 'u', 'e'])
+            || chars[index..].starts_with(&['f', 'a', 'l', 's', 'e'])
+            || chars[index..].starts_with(&['n', 'u', 'l', 'l'])
+        {
+            let start = index;
+            while index < chars.len() && chars[index].is_ascii_alphabetic() {
+                index += 1;
+            }
+            spans.push(Span::styled(
+                chars[start..index].iter().collect::<String>(),
+                Style::default().fg(WARN),
+            ));
+            continue;
+        }
+
+        spans.push(Span::styled(
+            ch.to_string(),
+            Style::default().fg(Color::White),
+        ));
+        index += 1;
+    }
+
+    Line::from(spans)
+}
+
+fn read_json_string(chars: &[char], start: usize) -> (String, usize) {
+    let mut index = start;
+    let mut escaped = false;
+    let mut token = String::new();
+    while index < chars.len() {
+        let ch = chars[index];
+        token.push(ch);
+        if index > start {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                return (token, index + 1);
+            }
+        }
+        index += 1;
+    }
+    (token, chars.len())
+}
+
 fn highlight_yaml_text(input: &str) -> Text<'static> {
     let lines = input
         .lines()
@@ -1406,19 +1579,19 @@ fn render_help_modal(frame: &mut Frame, app: &App) {
         Line::from("orca keymap"),
         Line::from(""),
         Line::from(
-            "Navigation: j/k (up/down), gg/G (top/bottom), Ctrl+u/Ctrl+d (jump), Ctrl+0..9 (views), Left/Right or :tab for resources",
+            "Navigation: j/k (up/down), gg/G (top/bottom), Ctrl+u/Ctrl+d (jump), Ctrl+0..9 (views), Left/Right or resource aliases",
         ),
         Line::from(
             "Modes: / (filter), : (command), > (jump), Tab (autocomplete), Esc (cancel), Enter (submit input)",
         ),
         Line::from(
-            "Commands: :ctx :cluster :ns/:namespace :all-ns :tab :crd :logs :shell/:ssh :edit :delete :restart :scale :exec :port-forward :refresh :q",
+            "Commands: :ctx/:context :cluster/:cl :user/:usr :contexts :clusters :users :ns/:namespace :all-ns :crd :logs :shell/:ssh :edit :delete :restart :scale :exec :port-forward :refresh :q",
         ),
         Line::from(
             "Resource aliases: po cj ds deploy rs rc sts job svc ing ingclass cm pvc secret sc pv sa role rb crole crb np node event ns crd",
         ),
         Line::from(
-            "Actions: Enter/d details, Esc dashboard, o overview, l logs, s shell, e edit, p port-forward prompt, Tab pane, r refresh, ? help",
+            "Actions: Enter drill-down, d details, Esc back, o overview, l pod logs, Shift+L related logs, s shell, e edit, p port-forward prompt, Tab pane, r refresh, ? help",
         ),
         Line::from("Top bar: compact icon value context; footer uses compact icon segments"),
         Line::from(""),

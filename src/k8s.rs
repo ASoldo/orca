@@ -28,9 +28,19 @@ pub struct KubeGateway {
     client: Client,
     context: String,
     cluster: String,
+    user: String,
     default_namespace: String,
     kube_targets: Vec<KubeTarget>,
     available_clusters: Vec<String>,
+    available_users: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLogTarget {
+    pub namespace: String,
+    pub pod_name: String,
+    pub container: Option<String>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +48,7 @@ struct KubeTarget {
     context: String,
     cluster_name: String,
     cluster_server: Option<String>,
+    user_name: Option<String>,
 }
 
 impl KubeGateway {
@@ -58,6 +69,10 @@ impl KubeGateway {
 
     pub fn available_clusters(&self) -> Vec<String> {
         self.available_clusters.clone()
+    }
+
+    pub fn available_users(&self) -> Vec<String> {
+        self.available_users.clone()
     }
 
     pub async fn switch_context(&mut self, context: &str) -> Result<()> {
@@ -96,12 +111,41 @@ impl KubeGateway {
         Ok(target_context)
     }
 
+    pub async fn switch_user(&mut self, user: &str) -> Result<String> {
+        let normalized = user.trim().to_ascii_lowercase();
+        let Some(target_context) = self
+            .kube_targets
+            .iter()
+            .find(|target| {
+                target
+                    .user_name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(user))
+                    || target
+                        .user_name
+                        .as_deref()
+                        .is_some_and(|name| name.to_ascii_lowercase().contains(&normalized))
+            })
+            .map(|target| target.context.clone())
+        else {
+            anyhow::bail!("User '{user}' was not found in kubeconfig contexts");
+        };
+
+        let switched = Self::from_kube_selection(Some(target_context.clone()), None).await?;
+        *self = switched;
+        Ok(target_context)
+    }
+
     pub fn cluster(&self) -> &str {
         &self.cluster
     }
 
     pub fn context(&self) -> &str {
         &self.context
+    }
+
+    pub fn user(&self) -> &str {
+        &self.user
     }
 
     pub fn default_namespace(&self) -> &str {
@@ -156,6 +200,13 @@ impl KubeGateway {
         available_clusters.sort();
         available_clusters.dedup();
 
+        let mut available_users = kube_targets
+            .iter()
+            .filter_map(|target| target.user_name.clone())
+            .collect::<Vec<_>>();
+        available_users.sort();
+        available_users.dedup();
+
         let active_context = context
             .or_else(|| {
                 kubeconfig
@@ -163,14 +214,21 @@ impl KubeGateway {
                     .and_then(|cfg| cfg.current_context.clone())
             })
             .unwrap_or_else(|| "in-cluster".to_string());
+        let active_user = kube_targets
+            .iter()
+            .find(|target| target.context == active_context)
+            .and_then(|target| target.user_name.clone())
+            .unwrap_or_else(|| "-".to_string());
 
         Ok(Self {
             client,
             context: active_context,
             cluster: cluster_url,
+            user: active_user,
             default_namespace,
             kube_targets,
             available_clusters,
+            available_users,
         })
     }
 
@@ -231,10 +289,18 @@ impl KubeGateway {
         Ok(table)
     }
 
-    pub async fn fetch_pod_logs(&self, namespace: &str, pod_name: &str) -> Result<String> {
+    pub async fn fetch_pod_logs(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        container: Option<&str>,
+        previous: bool,
+    ) -> Result<String> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let params = LogParams {
-            tail_lines: Some(250),
+            container: container.map(str::to_string),
+            previous,
+            tail_lines: Some(500),
             timestamps: true,
             ..LogParams::default()
         };
@@ -245,6 +311,79 @@ impl KubeGateway {
             .with_context(|| format!("failed to load logs for {namespace}/{pod_name}"))?;
 
         Ok(logs)
+    }
+
+    pub async fn pod_containers(&self, namespace: &str, pod_name: &str) -> Result<Vec<String>> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod = pods
+            .get(pod_name)
+            .await
+            .with_context(|| format!("failed to fetch pod {namespace}/{pod_name}"))?;
+
+        let mut containers = Vec::new();
+        if let Some(spec) = pod.spec.as_ref() {
+            for container in &spec.containers {
+                containers.push(container.name.clone());
+            }
+            for container in spec.init_containers.as_ref().into_iter().flatten() {
+                containers.push(container.name.clone());
+            }
+        }
+        containers.sort();
+        containers.dedup();
+        Ok(containers)
+    }
+
+    pub async fn resolve_log_target(
+        &self,
+        tab: ResourceTab,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<ResolvedLogTarget> {
+        let namespace = namespace
+            .map(str::to_string)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                if self.default_namespace.is_empty() {
+                    None
+                } else {
+                    Some(self.default_namespace.clone())
+                }
+            })
+            .context("namespace is required to resolve related logs")?;
+
+        if tab == ResourceTab::Pods {
+            return self
+                .resolve_pod_log_target(&namespace, name)
+                .await
+                .map(|mut target| {
+                    target.source = "pod".to_string();
+                    target
+                });
+        }
+
+        if tab == ResourceTab::Services {
+            return self.resolve_service_log_target(&namespace, name).await;
+        }
+
+        if !matches!(
+            tab,
+            ResourceTab::Deployments
+                | ResourceTab::DaemonSets
+                | ResourceTab::StatefulSets
+                | ResourceTab::ReplicaSets
+                | ResourceTab::ReplicationControllers
+                | ResourceTab::Jobs
+                | ResourceTab::CronJobs
+        ) {
+            anyhow::bail!(
+                "Related logs are not supported for {}. Use Pods tab or Shift+L on workloads/services",
+                tab.title()
+            );
+        }
+
+        self.resolve_workload_log_target(tab, &namespace, name)
+            .await
     }
 
     pub async fn fetch_overview_metrics(&self, scope: &NamespaceScope) -> Result<OverviewMetrics> {
@@ -2101,6 +2240,95 @@ impl KubeGateway {
             rows,
         ))
     }
+
+    async fn resolve_pod_log_target(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<ResolvedLogTarget> {
+        let containers = self.pod_containers(namespace, pod_name).await?;
+        Ok(ResolvedLogTarget {
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            container: containers.first().cloned(),
+            source: format!("pod {namespace}/{pod_name}"),
+        })
+    }
+
+    async fn resolve_workload_log_target(
+        &self,
+        tab: ResourceTab,
+        namespace: &str,
+        name: &str,
+    ) -> Result<ResolvedLogTarget> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod_list = pods
+            .list(&list_params())
+            .await
+            .with_context(|| format!("failed to list pods in namespace '{namespace}'"))?;
+        let Some(best_pod) =
+            select_best_related_pod(&pod_list.items, name, owner_kind_for_tab(tab))
+        else {
+            anyhow::bail!(
+                "No related pods were found for {} {}/{}",
+                tab.title(),
+                namespace,
+                name
+            );
+        };
+        let pod_name = best_pod.name_any();
+        Ok(ResolvedLogTarget {
+            namespace: namespace.to_string(),
+            pod_name,
+            container: first_pod_container(best_pod),
+            source: format!("{} {namespace}/{}", tab.title(), name),
+        })
+    }
+
+    async fn resolve_service_log_target(
+        &self,
+        namespace: &str,
+        service_name: &str,
+    ) -> Result<ResolvedLogTarget> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service = services
+            .get(service_name)
+            .await
+            .with_context(|| format!("failed to fetch service {namespace}/{service_name}"))?;
+
+        let selector = service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.selector.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        if selector.is_empty() {
+            anyhow::bail!("service {namespace}/{service_name} has no selector");
+        }
+
+        let selector_query = selector
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod_list = pods
+            .list(&list_params().labels(&selector_query))
+            .await
+            .with_context(|| {
+                format!("failed to list pods for service {namespace}/{service_name}")
+            })?;
+        let Some(best_pod) = select_best_related_pod(&pod_list.items, service_name, None) else {
+            anyhow::bail!("No pods matched selector for service {namespace}/{service_name}");
+        };
+        let pod_name = best_pod.name_any();
+        Ok(ResolvedLogTarget {
+            namespace: namespace.to_string(),
+            pod_name,
+            container: first_pod_container(best_pod),
+            source: format!("service {namespace}/{service_name}"),
+        })
+    }
 }
 
 fn build_kube_targets(kubeconfig: &Kubeconfig) -> Vec<KubeTarget> {
@@ -2125,6 +2353,7 @@ fn build_kube_targets(kubeconfig: &Kubeconfig) -> Vec<KubeTarget> {
                     .get(&context.cluster)
                     .cloned()
                     .unwrap_or(None),
+                user_name: context.user.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -2135,6 +2364,98 @@ fn build_kube_targets(kubeconfig: &Kubeconfig) -> Vec<KubeTarget> {
             .then_with(|| left.cluster_name.cmp(&right.cluster_name))
     });
     targets
+}
+
+fn owner_kind_for_tab(tab: ResourceTab) -> Option<&'static str> {
+    match tab {
+        ResourceTab::Deployments => Some("Deployment"),
+        ResourceTab::DaemonSets => Some("DaemonSet"),
+        ResourceTab::StatefulSets => Some("StatefulSet"),
+        ResourceTab::ReplicaSets => Some("ReplicaSet"),
+        ResourceTab::ReplicationControllers => Some("ReplicationController"),
+        ResourceTab::Jobs => Some("Job"),
+        ResourceTab::CronJobs => Some("CronJob"),
+        _ => None,
+    }
+}
+
+fn select_best_related_pod<'a>(
+    pods: &'a [Pod],
+    resource_name: &str,
+    expected_owner_kind: Option<&str>,
+) -> Option<&'a Pod> {
+    pods.iter()
+        .max_by_key(|pod| pod_relation_score(pod, resource_name, expected_owner_kind))
+        .filter(|pod| pod_relation_score(pod, resource_name, expected_owner_kind) > 0)
+}
+
+fn pod_relation_score(pod: &Pod, resource_name: &str, expected_owner_kind: Option<&str>) -> u64 {
+    let resource = resource_name.to_ascii_lowercase();
+    let pod_name = pod.name_any();
+    let pod_name_lower = pod_name.to_ascii_lowercase();
+    let mut score = 0u64;
+
+    if pod_name_lower == resource {
+        score = score.saturating_add(600);
+    }
+    if pod_name_lower.starts_with(&format!("{resource}-")) {
+        score = score.saturating_add(420);
+    }
+    if pod_name_lower.contains(&resource) {
+        score = score.saturating_add(160);
+    }
+
+    if let Some(owner_refs) = pod.metadata.owner_references.as_ref() {
+        for owner in owner_refs {
+            let owner_name = owner.name.to_ascii_lowercase();
+            if owner_name == resource {
+                score = score.saturating_add(560);
+            }
+            if owner_name.starts_with(&format!("{resource}-")) {
+                score = score.saturating_add(360);
+            }
+            if owner_name.contains(&resource) {
+                score = score.saturating_add(140);
+            }
+            if let Some(kind) = expected_owner_kind
+                && owner.kind.eq_ignore_ascii_case(kind)
+            {
+                score = score.saturating_add(220);
+                if owner_name == resource {
+                    score = score.saturating_add(280);
+                }
+            }
+        }
+    }
+
+    if score > 0 || expected_owner_kind.is_none() {
+        score.saturating_add(pod_running_score(pod))
+    } else {
+        score
+    }
+}
+
+fn pod_running_score(pod: &Pod) -> u64 {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        .map(|phase| {
+            if phase.eq_ignore_ascii_case("Running") {
+                48
+            } else if phase.eq_ignore_ascii_case("Pending") {
+                18
+            } else {
+                6
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn first_pod_container(pod: &Pod) -> Option<String> {
+    pod.spec
+        .as_ref()
+        .and_then(|spec| spec.containers.first())
+        .map(|container| container.name.clone())
 }
 
 fn parse_pod_metrics_usage(data: &Value) -> (u64, u64) {

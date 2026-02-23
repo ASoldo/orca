@@ -15,11 +15,13 @@ pub enum Action {
     ToggleHelp,
     ToggleFocus,
     EnterResource,
+    ShowDetails,
     StartCommand,
     StartJump,
     StartFilter,
     Refresh,
     LoadPodLogs,
+    LoadResourceLogs,
     OpenPodShell,
     EditResource,
     StartPortForwardPrompt,
@@ -77,12 +79,13 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('.') if key.modifiers.contains(KeyModifiers::SHIFT) => {
             Some(Action::StartJump)
         }
-        KeyCode::Char('l') | KeyCode::Char('L') => Some(Action::LoadPodLogs),
+        KeyCode::Char('l') => Some(Action::LoadPodLogs),
+        KeyCode::Char('L') => Some(Action::LoadResourceLogs),
         KeyCode::Char('s') => Some(Action::OpenPodShell),
         KeyCode::Char('e') => Some(Action::EditResource),
         KeyCode::Char('p') => Some(Action::StartPortForwardPrompt),
         KeyCode::Char('o') => Some(Action::ToggleOverview),
-        KeyCode::Char('d') if key.modifiers.is_empty() => Some(Action::EnterResource),
+        KeyCode::Char('d') if key.modifiers.is_empty() => Some(Action::ShowDetails),
         KeyCode::Char('y') => Some(Action::ConfirmYes),
         KeyCode::Char('n') => Some(Action::ConfirmNo),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -217,7 +220,14 @@ mod tests {
     fn normal_mode_maps_d_to_details() {
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
         let action = map_key(InputMode::Normal, key);
-        assert_eq!(action, Some(Action::EnterResource));
+        assert_eq!(action, Some(Action::ShowDetails));
+    }
+
+    #[test]
+    fn normal_mode_maps_shift_l_to_related_logs() {
+        let key = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        let action = map_key(InputMode::Normal, key);
+        assert_eq!(action, Some(Action::LoadResourceLogs));
     }
 
     #[test]

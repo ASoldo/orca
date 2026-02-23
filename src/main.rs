@@ -79,7 +79,12 @@ async fn main() -> Result<()> {
         gateway.context().to_string(),
         namespace_scope,
     );
-    app.set_kube_catalog(gateway.available_contexts(), gateway.available_clusters());
+    app.set_user(gateway.user().to_string());
+    app.set_kube_catalog(
+        gateway.available_contexts(),
+        gateway.available_clusters(),
+        gateway.available_users(),
+    );
 
     if args.all_namespaces && args.namespace.is_some() {
         warn!("both --all-namespaces and --namespace were provided, using all namespaces");
@@ -296,14 +301,97 @@ async fn execute_app_command(
         AppCommand::LoadPodLogs {
             namespace,
             pod_name,
-        } => match gateway.fetch_pod_logs(&namespace, &pod_name).await {
+            container,
+            previous,
+        } => match gateway
+            .fetch_pod_logs(&namespace, &pod_name, container.as_deref(), previous)
+            .await
+        {
             Ok(logs) => {
-                app.set_table_overlay("Pod Logs", logs);
+                let title = match (container.as_deref(), previous) {
+                    (Some(container), true) => {
+                        format!("Pod Logs (previous) {namespace}/{pod_name}:{container}")
+                    }
+                    (Some(container), false) => {
+                        format!("Pod Logs {namespace}/{pod_name}:{container}")
+                    }
+                    (None, true) => format!("Pod Logs (previous) {namespace}/{pod_name}"),
+                    (None, false) => format!("Pod Logs {namespace}/{pod_name}"),
+                };
+                app.set_table_overlay(title, logs);
                 app.set_status(format!("Loaded logs for {namespace}/{pod_name}"));
             }
             Err(error) => {
                 app.set_status(format!(
                     "Failed loading logs for {namespace}/{pod_name}: {error:#}"
+                ));
+            }
+        },
+        AppCommand::LoadResourceLogs {
+            tab,
+            namespace,
+            name,
+            previous,
+        } => match gateway
+            .resolve_log_target(tab, namespace.as_deref(), &name)
+            .await
+        {
+            Ok(target) => match gateway
+                .fetch_pod_logs(
+                    &target.namespace,
+                    &target.pod_name,
+                    target.container.as_deref(),
+                    previous,
+                )
+                .await
+            {
+                Ok(logs) => {
+                    let title = match (target.container.as_deref(), previous) {
+                        (Some(container), true) => format!(
+                            "Logs (previous) {}/{}:{}",
+                            target.namespace, target.pod_name, container
+                        ),
+                        (Some(container), false) => {
+                            format!(
+                                "Logs {}/{}:{}",
+                                target.namespace, target.pod_name, container
+                            )
+                        }
+                        (None, true) => {
+                            format!("Logs (previous) {}/{}", target.namespace, target.pod_name)
+                        }
+                        (None, false) => format!("Logs {}/{}", target.namespace, target.pod_name),
+                    };
+                    app.set_table_overlay(title, logs);
+                    app.set_status(format!(
+                        "Loaded related logs via {} for {}/{}",
+                        target.source, target.namespace, target.pod_name
+                    ));
+                }
+                Err(error) => app.set_status(format!(
+                    "Failed loading related logs for {}/{}: {error:#}",
+                    target.namespace, target.pod_name
+                )),
+            },
+            Err(error) => {
+                app.set_status(format!(
+                    "Failed resolving logs for {} {}: {error:#}",
+                    tab.title(),
+                    name
+                ));
+            }
+        },
+        AppCommand::LoadPodContainers {
+            namespace,
+            pod_name,
+        } => match gateway.pod_containers(&namespace, &pod_name).await {
+            Ok(containers) => {
+                app.set_container_picker(namespace.clone(), pod_name.clone(), containers);
+                app.set_status(format!("Loaded containers for {namespace}/{pod_name}"));
+            }
+            Err(error) => {
+                app.set_status(format!(
+                    "Failed loading containers for {namespace}/{pod_name}: {error:#}"
                 ));
             }
         },
@@ -484,10 +572,15 @@ async fn execute_app_command(
                 app.set_kube_target(
                     gateway.cluster().to_string(),
                     gateway.context().to_string(),
+                    gateway.user().to_string(),
                     gateway.default_namespace().to_string(),
                     true,
                 );
-                app.set_kube_catalog(gateway.available_contexts(), gateway.available_clusters());
+                app.set_kube_catalog(
+                    gateway.available_contexts(),
+                    gateway.available_clusters(),
+                    gateway.available_users(),
+                );
                 refresh_custom_resource_catalog(app, gateway).await;
                 let tabs = app.tabs().to_vec();
                 for tab in tabs {
@@ -509,10 +602,15 @@ async fn execute_app_command(
                 app.set_kube_target(
                     gateway.cluster().to_string(),
                     gateway.context().to_string(),
+                    gateway.user().to_string(),
                     gateway.default_namespace().to_string(),
                     true,
                 );
-                app.set_kube_catalog(gateway.available_contexts(), gateway.available_clusters());
+                app.set_kube_catalog(
+                    gateway.available_contexts(),
+                    gateway.available_clusters(),
+                    gateway.available_users(),
+                );
                 refresh_custom_resource_catalog(app, gateway).await;
                 let tabs = app.tabs().to_vec();
                 for tab in tabs {
@@ -529,6 +627,35 @@ async fn execute_app_command(
             Err(error) => {
                 app.set_status(format!("Cluster switch failed for '{cluster}': {error:#}"))
             }
+        },
+        AppCommand::SwitchUser { user } => match gateway.switch_user(&user).await {
+            Ok(context) => {
+                app.set_kube_target(
+                    gateway.cluster().to_string(),
+                    gateway.context().to_string(),
+                    gateway.user().to_string(),
+                    gateway.default_namespace().to_string(),
+                    true,
+                );
+                app.set_kube_catalog(
+                    gateway.available_contexts(),
+                    gateway.available_clusters(),
+                    gateway.available_users(),
+                );
+                refresh_custom_resource_catalog(app, gateway).await;
+                let tabs = app.tabs().to_vec();
+                for tab in tabs {
+                    refresh_tab(app, gateway, tab).await;
+                }
+                app.set_status(format!(
+                    "Switched user '{}' via context '{}' ({})",
+                    user,
+                    context,
+                    gateway.cluster()
+                ));
+                return LoopEffect::RestartWatchers;
+            }
+            Err(error) => app.set_status(format!("User switch failed for '{user}': {error:#}")),
         },
     }
 

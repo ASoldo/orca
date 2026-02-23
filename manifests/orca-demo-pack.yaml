@@ -1,0 +1,621 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: orca-sandbox
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orca-demo-config
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+data:
+  APP_MODE: demo
+  FEATURE_FLAG: "true"
+  LOG_LEVEL: debug
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orca-demo-secret
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+type: Opaque
+stringData:
+  API_TOKEN: demo-token-123
+  PASSWORD: not-a-real-secret
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orca-demo-sa
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orca-demo-role
+  namespace: openclaw
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps", "secrets", "events"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orca-demo-rolebinding
+  namespace: openclaw
+subjects:
+- kind: ServiceAccount
+  name: orca-demo-sa
+  namespace: openclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: orca-demo-role
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: orca-demo-viewer
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "namespaces"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: orca-demo-viewer-binding
+subjects:
+- kind: ServiceAccount
+  name: orca-demo-sa
+  namespace: openclaw
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: orca-demo-viewer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca-web
+  namespace: openclaw
+  labels:
+    app: orca-web
+    tier: frontend
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orca-web
+  template:
+    metadata:
+      labels:
+        app: orca-web
+        tier: frontend
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      serviceAccountName: orca-demo-sa
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca-api
+  namespace: openclaw
+  labels:
+    app: orca-api
+    tier: backend
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orca-api
+  template:
+    metadata:
+      labels:
+        app: orca-api
+        tier: backend
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: http-echo
+        image: hashicorp/http-echo:1.0.0
+        args: ["-listen=:5678", "-text=orca-api-ok"]
+        ports:
+        - containerPort: 5678
+        resources:
+          requests:
+            cpu: "20m"
+            memory: "32Mi"
+          limits:
+            cpu: "100m"
+            memory: "96Mi"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca-broken
+  namespace: openclaw
+  labels:
+    app: orca-broken
+    tier: chaos
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orca-broken
+  template:
+    metadata:
+      labels:
+        app: orca-broken
+        tier: chaos
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: bad-image
+        image: doesnotexist.example.invalid/orca:nope
+        imagePullPolicy: Always
+---
+apiVersion: apps/v1
+kind: ReplicaSet
+metadata:
+  name: orca-standalone-rs
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orca-rs
+  template:
+    metadata:
+      labels:
+        app: orca-rs
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: rs-sleeper
+        image: alpine:3.20
+        command: ["sh", "-c", "sleep 36000"]
+---
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: orca-legacy-rc
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 1
+  selector:
+    app: orca-legacy
+  template:
+    metadata:
+      labels:
+        app: orca-legacy
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: legacy
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-redis-headless
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  clusterIP: None
+  selector:
+    app: orca-redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orca-redis
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  serviceName: orca-redis-headless
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orca-redis
+  template:
+    metadata:
+      labels:
+        app: orca-redis
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: orca-node-agent
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  selector:
+    matchLabels:
+      app: orca-node-agent
+  template:
+    metadata:
+      labels:
+        app: orca-node-agent
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: agent
+        image: alpine:3.20
+        command: ["sh", "-c", "while true; do echo agent-ok; sleep 60; done"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-batch-success
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: success
+        image: busybox:1.36
+        command: ["sh", "-c", "echo done && sleep 2"]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-batch-fail
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: fail
+        image: busybox:1.36
+        command: ["sh", "-c", "echo fail && exit 1"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: orca-cron
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  schedule: "*/5 * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cron
+            image: busybox:1.36
+            command: ["sh", "-c", "date; echo cron-run"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orca-shell
+  namespace: openclaw
+  labels:
+    app: orca-shell
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  containers:
+  - name: toolbox
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep 36000"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orca-crashy
+  namespace: openclaw
+  labels:
+    app: orca-crashy
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  containers:
+  - name: crash
+    image: busybox:1.36
+    command: ["sh", "-c", "echo boom; exit 1"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-web-svc
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  selector:
+    app: orca-web
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-api-nodeport
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  type: NodePort
+  selector:
+    app: orca-api
+  ports:
+  - name: http
+    port: 5678
+    targetPort: 5678
+    nodePort: 30080
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: orca-shared-pvc
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orca-deny-external
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: orca-api
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: orca-web
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orca-ingress
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  rules:
+  - host: orca.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: orca-web-svc
+            port:
+              number: 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orca-sandbox-config
+  namespace: orca-sandbox
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+data:
+  note: sandbox-namespace-for-orca-testing
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orca-sandbox-web
+  namespace: orca-sandbox
+  labels:
+    app: orca-sandbox-web
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orca-sandbox-web
+  template:
+    metadata:
+      labels:
+        app: orca-sandbox-web
+        app.kubernetes.io/part-of: orca-demo
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orca-sandbox-web-svc
+  namespace: orca-sandbox
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  selector:
+    app: orca-sandbox-web
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orca-sandbox-job
+  namespace: orca-sandbox
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: task
+        image: busybox:1.36
+        command: ["sh", "-c", "echo sandbox-job && sleep 5"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: orca-sandbox-cron
+  namespace: orca-sandbox
+  labels:
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  schedule: "*/10 * * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: cron
+            image: busybox:1.36
+            command: ["sh", "-c", "date; echo sandbox-cron"]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: orca-sandbox-shell
+  namespace: orca-sandbox
+  labels:
+    app: orca-sandbox-shell
+    app.kubernetes.io/part-of: orca-demo
+spec:
+  containers:
+  - name: toolbox
+    image: alpine:3.20
+    command: ["sh", "-c", "sleep 36000"]
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.orca.dev
+spec:
+  group: orca.dev
+  names:
+    kind: Widget
+    plural: widgets
+    singular: widget
+    shortNames: ["wdg"]
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              version:
+                type: string
+              owner:
+                type: string
+              replicas:
+                type: integer
+---
+apiVersion: orca.dev/v1alpha1
+kind: Widget
+metadata:
+  name: widget-alpha
+  namespace: openclaw
+spec:
+  version: "0.1.0"
+  owner: devops
+  replicas: 2
+---
+apiVersion: orca.dev/v1alpha1
+kind: Widget
+metadata:
+  name: widget-beta
+  namespace: openclaw
+spec:
+  version: "0.2.0"
+  owner: platform
+  replicas: 1
