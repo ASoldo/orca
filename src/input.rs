@@ -61,8 +61,10 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::SwitchView(0))
         }
-        KeyCode::Char('j') | KeyCode::Down => Some(Action::Down),
-        KeyCode::Char('k') | KeyCode::Up => Some(Action::Up),
+        KeyCode::Char('j') if key.modifiers.is_empty() => Some(Action::Down),
+        KeyCode::Down => Some(Action::Down),
+        KeyCode::Char('k') if key.modifiers.is_empty() => Some(Action::Up),
+        KeyCode::Up => Some(Action::Up),
         KeyCode::Left => Some(Action::PrevTab),
         KeyCode::Right => Some(Action::NextTab),
         KeyCode::Char('g') => Some(Action::GPrefix),
@@ -86,13 +88,18 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('p') => Some(Action::StartPortForwardPrompt),
         KeyCode::Char('o') => Some(Action::ToggleOverview),
         KeyCode::Char('d') if key.modifiers.is_empty() => Some(Action::ShowDetails),
-        KeyCode::Char('y') => Some(Action::ConfirmYes),
-        KeyCode::Char('n') => Some(Action::ConfirmNo),
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::ConfirmYes),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(Action::ConfirmNo),
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::SwitchView(9))
         }
         KeyCode::Tab => Some(Action::ToggleFocus),
         KeyCode::Enter => Some(Action::EnterResource),
+        KeyCode::Char('m') | KeyCode::Char('j')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::EnterResource)
+        }
         KeyCode::Esc if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::SwitchView(3))
         }
@@ -150,6 +157,11 @@ fn map_input_mode_key(key: KeyEvent) -> Option<Action> {
             Some(Action::SwitchView(0))
         }
         KeyCode::Enter => Some(Action::SubmitInput),
+        KeyCode::Char('m') | KeyCode::Char('j')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Some(Action::SubmitInput)
+        }
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::SwitchView(9))
         }
@@ -228,6 +240,42 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
         let action = map_key(InputMode::Normal, key);
         assert_eq!(action, Some(Action::LoadResourceLogs));
+    }
+
+    #[test]
+    fn input_mode_maps_ctrl_m_and_ctrl_j_to_submit() {
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_key(InputMode::Command, ctrl_m),
+            Some(Action::SubmitInput)
+        );
+        assert_eq!(
+            map_key(InputMode::Command, ctrl_j),
+            Some(Action::SubmitInput)
+        );
+    }
+
+    #[test]
+    fn normal_mode_maps_ctrl_m_and_ctrl_j_to_enter() {
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let ctrl_j = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        assert_eq!(
+            map_key(InputMode::Normal, ctrl_m),
+            Some(Action::EnterResource)
+        );
+        assert_eq!(
+            map_key(InputMode::Normal, ctrl_j),
+            Some(Action::EnterResource)
+        );
+    }
+
+    #[test]
+    fn normal_mode_maps_uppercase_confirmation_keys() {
+        let yes = KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT);
+        let no = KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT);
+        assert_eq!(map_key(InputMode::Normal, yes), Some(Action::ConfirmYes));
+        assert_eq!(map_key(InputMode::Normal, no), Some(Action::ConfirmNo));
     }
 
     #[test]

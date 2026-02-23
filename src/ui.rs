@@ -49,11 +49,15 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let slot_count = app.visible_view_slots().len() as u16;
-    let slot_width = slot_count.saturating_mul(3).saturating_add(1);
-    let desired_right = slot_width.clamp(12, 40);
-    let max_right = area.width.saturating_sub(24).max(1);
-    let right_width = desired_right.min(max_right);
+    let right_line = build_right_header_line(app);
+    let right_width = spans_width(&right_line.spans) as u16;
+    if right_width == 0 || right_width >= area.width {
+        frame.render_widget(
+            Paragraph::new(left_line).style(Style::default().bg(BG).fg(Color::White)),
+            area,
+        );
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(right_width)])
@@ -63,11 +67,8 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         chunks[0],
     );
 
-    let right_line = build_right_header_line(app);
     frame.render_widget(
-        Paragraph::new(right_line)
-            .style(Style::default().bg(BG))
-            .alignment(Alignment::Right),
+        Paragraph::new(right_line).style(Style::default().bg(BG)),
         chunks[1],
     );
 }
@@ -360,15 +361,27 @@ fn render_container_picker(frame: &mut Frame, area: Rect, app: &App, focused: bo
     let title = app
         .container_picker_title()
         .unwrap_or_else(|| "Containers".to_string());
+    let pod_name = app
+        .container_picker_pod_name()
+        .unwrap_or_else(|| "-".to_string());
+    let headers = app.container_picker_headers();
     let items = app.container_picker_items();
-    let header = Row::new(vec![
-        Cell::from("Container".to_string()).style(Style::default().add_modifier(Modifier::BOLD)),
-    ])
+    let header = Row::new(headers.iter().map(|header| {
+        Cell::from(header.clone()).style(Style::default().add_modifier(Modifier::BOLD))
+    }))
     .height(1)
     .style(Style::default().fg(ACCENT));
     let rows = items.iter().map(|item| {
         Row::new(vec![
-            Cell::from(item.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(item.idx.to_string()).style(Style::default().fg(Color::White)),
+            Cell::from(compact_text(&pod_name, 26)).style(Style::default().fg(Color::White)),
+            Cell::from(item.name.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(compact_text(&item.image, 28)).style(Style::default().fg(Color::White)),
+            Cell::from(item.ready.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(compact_text(&item.state, 16)).style(Style::default().fg(Color::White)),
+            Cell::from(item.restarts.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(item.age.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(item.pf.clone()).style(Style::default().fg(Color::White)),
         ])
     });
 
@@ -382,16 +395,29 @@ fn render_container_picker(frame: &mut Frame, area: Rect, app: &App, focused: bo
         })
         .style(Style::default().bg(PANEL));
 
-    let table = Table::new(rows, vec![Constraint::Percentage(100)])
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::Rgb(24, 36, 58))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("󰜴 ");
+    let table = Table::new(
+        rows,
+        vec![
+            Constraint::Length(4),
+            Constraint::Length(27),
+            Constraint::Length(22),
+            Constraint::Length(30),
+            Constraint::Length(7),
+            Constraint::Length(14),
+            Constraint::Length(9),
+            Constraint::Length(6),
+            Constraint::Length(11),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(1)
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::Rgb(24, 36, 58))
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("󰜴 ");
 
     let mut state = TableState::default();
     state.select(app.container_picker_selected_index());
@@ -1186,9 +1212,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
     if app.has_completion_mode() {
         let completions = app.completion_candidates();
-        if completions.is_empty() {
-            spans.push(Span::styled(" no matches", Style::default().fg(MUTED)));
-        } else {
+        if !completions.is_empty() {
             let selected = app
                 .completion_index()
                 .min(completions.len().saturating_sub(1));

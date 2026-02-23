@@ -303,30 +303,49 @@ async fn execute_app_command(
             pod_name,
             container,
             previous,
-        } => match gateway
-            .fetch_pod_logs(&namespace, &pod_name, container.as_deref(), previous)
-            .await
-        {
-            Ok(logs) => {
-                let title = match (container.as_deref(), previous) {
-                    (Some(container), true) => {
-                        format!("Pod Logs (previous) {namespace}/{pod_name}:{container}")
-                    }
-                    (Some(container), false) => {
-                        format!("Pod Logs {namespace}/{pod_name}:{container}")
-                    }
-                    (None, true) => format!("Pod Logs (previous) {namespace}/{pod_name}"),
-                    (None, false) => format!("Pod Logs {namespace}/{pod_name}"),
-                };
-                app.set_pod_logs_overlay(title, logs);
-                app.set_status(format!("Loaded logs for {namespace}/{pod_name}"));
+        } => {
+            let mut resolved_container = container.clone();
+            if resolved_container.is_none()
+                && let Ok(containers) = gateway.pod_containers(&namespace, &pod_name).await
+            {
+                resolved_container = containers.first().map(|entry| entry.name.clone());
             }
-            Err(error) => {
-                app.set_status(format!(
-                    "Failed loading logs for {namespace}/{pod_name}: {error:#}"
-                ));
+
+            match gateway
+                .fetch_pod_logs(
+                    &namespace,
+                    &pod_name,
+                    resolved_container.as_deref(),
+                    previous,
+                )
+                .await
+            {
+                Ok(logs) => {
+                    let title = match (resolved_container.as_deref(), previous) {
+                        (Some(container), true) => {
+                            format!("Container Logs (previous) {namespace}/{pod_name}:{container}")
+                        }
+                        (Some(container), false) => {
+                            format!("Container Logs {namespace}/{pod_name}:{container}")
+                        }
+                        (None, true) => format!("Pod Logs (previous) {namespace}/{pod_name}"),
+                        (None, false) => format!("Pod Logs {namespace}/{pod_name}"),
+                    };
+                    app.set_pod_logs_overlay(title, logs);
+                    app.set_status(match resolved_container.as_deref() {
+                        Some(container) => {
+                            format!("Loaded container logs for {namespace}/{pod_name}:{container}")
+                        }
+                        None => format!("Loaded pod logs for {namespace}/{pod_name}"),
+                    });
+                }
+                Err(error) => {
+                    app.set_status(format!(
+                        "Failed loading logs for {namespace}/{pod_name}: {error:#}"
+                    ));
+                }
             }
-        },
+        }
         AppCommand::LoadResourceLogs {
             tab,
             namespace,

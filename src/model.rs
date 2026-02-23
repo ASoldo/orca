@@ -202,6 +202,16 @@ pub struct CustomResourceDef {
     pub namespaced: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub struct PodContainerInfo {
+    pub name: String,
+    pub image: String,
+    pub ready: bool,
+    pub state: String,
+    pub restarts: u32,
+    pub age: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum NamespaceScope {
     All,

@@ -20,7 +20,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::model::{
-    CustomResourceDef, NamespaceScope, OverviewMetrics, ResourceTab, RowData, TableData,
+    CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo, ResourceTab, RowData,
+    TableData,
 };
 
 #[derive(Clone)]
@@ -313,25 +314,75 @@ impl KubeGateway {
         Ok(logs)
     }
 
-    pub async fn pod_containers(&self, namespace: &str, pod_name: &str) -> Result<Vec<String>> {
+    pub async fn pod_containers(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<Vec<PodContainerInfo>> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let pod = pods
             .get(pod_name)
             .await
             .with_context(|| format!("failed to fetch pod {namespace}/{pod_name}"))?;
 
-        let mut containers = Vec::new();
+        let pod_age = human_age(pod.metadata.creation_timestamp.as_ref());
+        let mut ordered = Vec::<(String, String)>::new();
         if let Some(spec) = pod.spec.as_ref() {
             for container in &spec.containers {
-                containers.push(container.name.clone());
+                ordered.push((
+                    container.name.clone(),
+                    container.image.clone().unwrap_or_else(|| "-".to_string()),
+                ));
             }
             for container in spec.init_containers.as_ref().into_iter().flatten() {
-                containers.push(container.name.clone());
+                ordered.push((
+                    container.name.clone(),
+                    container.image.clone().unwrap_or_else(|| "-".to_string()),
+                ));
             }
         }
-        containers.sort();
-        containers.dedup();
-        Ok(containers)
+
+        let mut statuses = HashMap::<String, PodContainerInfo>::new();
+        if let Some(status) = pod.status.as_ref() {
+            for container in status.container_statuses.as_ref().into_iter().flatten() {
+                statuses.insert(
+                    container.name.clone(),
+                    pod_container_from_status(container, &pod_age),
+                );
+            }
+            for container in status
+                .init_container_statuses
+                .as_ref()
+                .into_iter()
+                .flatten()
+            {
+                statuses.insert(
+                    container.name.clone(),
+                    pod_container_from_status(container, &pod_age),
+                );
+            }
+        }
+
+        let mut rows = Vec::new();
+        for (name, image) in ordered {
+            let mut info = statuses.remove(&name).unwrap_or_default();
+            info.name = name;
+            if info.image.is_empty() || info.image == "-" {
+                info.image = image;
+            }
+            if info.age.is_empty() {
+                info.age = pod_age.clone();
+            }
+            rows.push(info);
+        }
+
+        if rows.is_empty() {
+            let mut fallback = statuses.into_values().collect::<Vec<_>>();
+            fallback.sort_by(|left, right| left.name.cmp(&right.name));
+            rows = fallback;
+        }
+
+        Ok(rows)
     }
 
     pub async fn resolve_log_target(
@@ -661,7 +712,7 @@ impl KubeGateway {
                 }
             }
         });
-        let params = PatchParams::apply("orca").force();
+        let params = PatchParams::default();
 
         match tab {
             ResourceTab::Deployments => {
@@ -686,7 +737,7 @@ impl KubeGateway {
         replicas: i32,
     ) -> Result<()> {
         let patch = serde_json::json!({ "spec": { "replicas": replicas } });
-        let params = PatchParams::apply("orca").force();
+        let params = PatchParams::default();
 
         match tab {
             ResourceTab::Deployments => {
@@ -2250,7 +2301,7 @@ impl KubeGateway {
         Ok(ResolvedLogTarget {
             namespace: namespace.to_string(),
             pod_name: pod_name.to_string(),
-            container: containers.first().cloned(),
+            container: containers.first().map(|container| container.name.clone()),
             source: format!("pod {namespace}/{pod_name}"),
         })
     }
@@ -2456,6 +2507,76 @@ fn first_pod_container(pod: &Pod) -> Option<String> {
         .as_ref()
         .and_then(|spec| spec.containers.first())
         .map(|container| container.name.clone())
+}
+
+fn pod_container_from_status(
+    container: &k8s_openapi::api::core::v1::ContainerStatus,
+    pod_age: &str,
+) -> PodContainerInfo {
+    let (state, age) = container_state_and_age(container, pod_age);
+    PodContainerInfo {
+        name: container.name.clone(),
+        image: container.image.clone(),
+        ready: container.ready,
+        state,
+        restarts: container.restart_count as u32,
+        age,
+    }
+}
+
+fn container_state_and_age(
+    container: &k8s_openapi::api::core::v1::ContainerStatus,
+    pod_age: &str,
+) -> (String, String) {
+    if let Some(state) = container.state.as_ref() {
+        if let Some(running) = state.running.as_ref() {
+            let age = running
+                .started_at
+                .as_ref()
+                .map(|time| human_age(Some(time)))
+                .unwrap_or_else(|| pod_age.to_string());
+            return ("Running".to_string(), age);
+        }
+        if let Some(waiting) = state.waiting.as_ref() {
+            let label = waiting
+                .reason
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "Waiting".to_string());
+            return (label, pod_age.to_string());
+        }
+        if let Some(terminated) = state.terminated.as_ref() {
+            let label = terminated
+                .reason
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("Exit({})", terminated.exit_code));
+            let age = terminated
+                .finished_at
+                .as_ref()
+                .map(|time| human_age(Some(time)))
+                .unwrap_or_else(|| pod_age.to_string());
+            return (label, age);
+        }
+    }
+
+    if let Some(last_state) = container.last_state.as_ref()
+        && let Some(terminated) = last_state.terminated.as_ref()
+    {
+        let label = terminated
+            .reason
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("Exit({})", terminated.exit_code));
+        let age = terminated
+            .finished_at
+            .as_ref()
+            .map(|time| human_age(Some(time)))
+            .unwrap_or_else(|| pod_age.to_string());
+        return (label, age);
+    }
+
+    ("Unknown".to_string(), pod_age.to_string())
 }
 
 fn parse_pod_metrics_usage(data: &Value) -> (u64, u64) {
