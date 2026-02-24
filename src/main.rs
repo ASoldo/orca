@@ -10,8 +10,8 @@ use app::{App, AppCommand};
 use clap::Parser;
 use cli::CliArgs;
 use crossterm::event::{
-    Event, EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -32,10 +32,11 @@ use k8s_openapi::api::storage::v1::StorageClass;
 use kube::runtime::watcher::{Config as WatchConfig, watcher};
 use kube::{Api, Client};
 use model::{NamespaceScope, ResourceTab};
+use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, Read, Stdout, Write};
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command as TokioCommand;
@@ -64,6 +65,17 @@ struct PortForwardExitEvent {
     local_port: u16,
     remote_port: u16,
     result: std::result::Result<std::process::ExitStatus, String>,
+}
+
+#[derive(Debug, Clone)]
+struct ShellOutputEvent {
+    chunk: String,
+}
+
+#[derive(Default)]
+struct EmbeddedShellState {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    writer: Option<Box<dyn Write + Send>>,
 }
 
 #[tokio::main]
@@ -189,6 +201,8 @@ async fn run_loop(
     let mut watch_tasks = start_resource_watchers(gateway.client(), watch_tx.clone());
     let mut watch_throttle = HashMap::<ResourceTab, Instant>::new();
     let (pf_tx, mut pf_rx) = mpsc::unbounded_channel::<PortForwardExitEvent>();
+    let (shell_output_tx, mut shell_output_rx) = mpsc::unbounded_channel::<ShellOutputEvent>();
+    let mut embedded_shell = EmbeddedShellState::default();
 
     loop {
         terminal
@@ -203,14 +217,35 @@ async fn run_loop(
             maybe_event = reader.next() => {
                 match maybe_event {
                     Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        if app.shell_overlay_active()
+                            && app.mode() == app::InputMode::Normal
+                            && key.code != KeyCode::Esc
+                        {
+                            if forward_key_to_embedded_shell(key, &mut embedded_shell.writer) {
+                                continue;
+                            }
+                        }
+
                         if let Some(action) = input::map_key(app.mode(), key) {
                             debug!("action={action:?}");
+                            let was_shell_open = app.shell_overlay_active();
                             let command = app.apply_action(action);
                             terminal
                                 .draw(|frame| ui::render(frame, app))
                                 .context("failed to render terminal frame")?;
                             let effect =
-                                execute_app_command(terminal, app, gateway, command, &pf_tx).await;
+                                execute_app_command(
+                                    terminal,
+                                    app,
+                                    gateway,
+                                    command,
+                                    &pf_tx,
+                                    &shell_output_tx,
+                                    &mut embedded_shell,
+                                ).await;
+                            if was_shell_open && !app.shell_overlay_active() {
+                                stop_embedded_shell(&mut embedded_shell).await;
+                            }
                             if matches!(effect, LoopEffect::RestartWatchers) {
                                 restart_watchers(&mut watch_tasks, gateway.client(), watch_tx.clone());
                                 watch_throttle.clear();
@@ -231,6 +266,28 @@ async fn run_loop(
             _ = ticker.tick() => {
                 let active = app.active_tab();
                 refresh_tab(app, gateway, active).await;
+
+                let mut should_reset_shell = false;
+                if let Some(child) = embedded_shell.child.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            if app.shell_overlay_active() {
+                                app.append_shell_output(&format!("\n[orca] shell exited: {status}\n"));
+                            }
+                            app.set_status(format!("Embedded shell exited: {status}"));
+                            should_reset_shell = true;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            app.set_status(format!("Embedded shell wait failed: {error}"));
+                            should_reset_shell = true;
+                        }
+                    }
+                }
+                if should_reset_shell {
+                    embedded_shell.child = None;
+                    embedded_shell.writer = None;
+                }
             }
             maybe_tab = watch_rx.recv() => {
                 if let Some(tab) = maybe_tab
@@ -267,9 +324,16 @@ async fn run_loop(
                     }
                 }
             }
+            maybe_shell_output = shell_output_rx.recv() => {
+                if let Some(event) = maybe_shell_output
+                    && app.shell_overlay_active() {
+                    app.append_shell_output(&event.chunk);
+                }
+            }
         }
     }
 
+    stop_embedded_shell(&mut embedded_shell).await;
     Ok(())
 }
 
@@ -279,6 +343,8 @@ async fn execute_app_command(
     gateway: &mut KubeGateway,
     command: AppCommand,
     pf_tx: &mpsc::UnboundedSender<PortForwardExitEvent>,
+    shell_output_tx: &mpsc::UnboundedSender<ShellOutputEvent>,
+    embedded_shell: &mut EmbeddedShellState,
 ) -> LoopEffect {
     match command {
         AppCommand::None => {}
@@ -502,25 +568,34 @@ async fn execute_app_command(
             pod_name,
             container,
             shell,
-        } => match run_kubectl_shell(
-            terminal,
-            &namespace,
-            &pod_name,
-            container.as_deref(),
-            &shell,
-        )
-        .await
-        {
-            Ok(()) => {
-                app.set_status(format!("Shell session closed for {namespace}/{pod_name}"));
-                if app.active_tab() == ResourceTab::Pods {
-                    refresh_tab(app, gateway, ResourceTab::Pods).await;
+        } => {
+            stop_embedded_shell(embedded_shell).await;
+            match start_embedded_kubectl_shell(&namespace, &pod_name, container.as_deref(), &shell)
+            {
+                Ok(started) => {
+                    let title = match container.as_deref() {
+                        Some(container) => {
+                            format!("Shell {namespace}/{pod_name}:{container} ({shell})")
+                        }
+                        None => format!("Shell {namespace}/{pod_name} ({shell})"),
+                    };
+                    app.set_shell_overlay(
+                        title,
+                        "[orca] embedded shell started (Esc to close)\n".to_string(),
+                    );
+
+                    spawn_shell_reader(started.reader, shell_output_tx.clone());
+                    embedded_shell.child = Some(started.child);
+                    embedded_shell.writer = Some(started.writer);
+                    app.set_status(format!(
+                        "Embedded shell opened for {namespace}/{pod_name} (Esc to close)"
+                    ));
                 }
+                Err(error) => app.set_status(format!(
+                    "Shell failed for {namespace}/{pod_name}: {error:#}"
+                )),
             }
-            Err(error) => app.set_status(format!(
-                "Shell failed for {namespace}/{pod_name}: {error:#}"
-            )),
-        },
+        }
         AppCommand::EditSelected {
             resource,
             namespace,
@@ -770,51 +845,239 @@ async fn run_kubectl_exec(namespace: &str, pod_name: &str, command: &[String]) -
     }
 }
 
-async fn run_kubectl_shell(
-    terminal: &mut TuiTerminal,
+struct StartedEmbeddedShell {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    reader: Box<dyn Read + Send>,
+}
+
+fn start_embedded_kubectl_shell(
     namespace: &str,
     pod_name: &str,
     container: Option<&str>,
     shell: &str,
-) -> Result<()> {
-    suspend_terminal_for_subprocess(terminal)?;
+) -> Result<StartedEmbeddedShell> {
+    let pty_system = native_pty_system();
+    let pty_pair = pty_system
+        .openpty(PtySize {
+            rows: 48,
+            cols: 180,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to allocate pseudo-tty for embedded shell")?;
 
-    let mut cmd = TokioCommand::new("kubectl");
-    cmd.arg("exec")
-        .arg("-it")
-        .arg("-n")
-        .arg(namespace)
-        .arg(pod_name);
+    let mut cmd = PtyCommandBuilder::new("kubectl");
+    cmd.arg("exec");
+    cmd.arg("-i");
+    cmd.arg("-t");
+    cmd.arg("-n");
+    cmd.arg(namespace);
+    cmd.arg(pod_name);
     if let Some(container) = container {
-        cmd.arg("-c").arg(container);
+        cmd.arg("-c");
+        cmd.arg(container);
     }
-    cmd.arg("--")
-        .arg(shell)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    cmd.arg("--");
+    cmd.arg(shell);
+    cmd.arg("-i");
 
-    let run_result = cmd
-        .status()
-        .await
-        .with_context(|| format!("failed to run kubectl shell for {namespace}/{pod_name}"));
-    let restore_result = resume_terminal_after_subprocess(terminal);
+    let child = pty_pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("failed to start embedded shell for {namespace}/{pod_name}"))?;
 
-    let status = match (run_result, restore_result) {
-        (Err(run_error), Err(restore_error)) => {
-            return Err(anyhow::anyhow!(
-                "{run_error:#}\nterminal resume error: {restore_error:#}"
-            ));
+    let reader = pty_pair
+        .master
+        .try_clone_reader()
+        .context("failed to capture embedded shell reader")?;
+    let writer = pty_pair
+        .master
+        .take_writer()
+        .context("failed to capture embedded shell writer")?;
+
+    Ok(StartedEmbeddedShell {
+        child,
+        writer,
+        reader,
+    })
+}
+
+fn spawn_shell_reader(
+    mut reader: Box<dyn Read + Send>,
+    tx: mpsc::UnboundedSender<ShellOutputEvent>,
+) {
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 4096];
+        let mut sanitizer = AnsiSanitizer::default();
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    let chunk = sanitizer.push(&buffer[..read]);
+                    if !chunk.is_empty() {
+                        let _ = tx.send(ShellOutputEvent { chunk });
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(ShellOutputEvent {
+                        chunk: format!("\n[orca] shell stream error: {error}\n"),
+                    });
+                    break;
+                }
+            }
         }
-        (Err(error), _) => return Err(error),
-        (_, Err(error)) => return Err(error),
-        (Ok(status), Ok(())) => status,
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AnsiParseState {
+    Text,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
+#[derive(Debug)]
+struct AnsiSanitizer {
+    state: AnsiParseState,
+    last_was_newline: bool,
+}
+
+impl Default for AnsiSanitizer {
+    fn default() -> Self {
+        Self {
+            state: AnsiParseState::Text,
+            last_was_newline: false,
+        }
+    }
+}
+
+impl AnsiSanitizer {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut out = Vec::with_capacity(bytes.len());
+        for byte in bytes {
+            match self.state {
+                AnsiParseState::Text => match *byte {
+                    0x1b => self.state = AnsiParseState::Esc,
+                    b'\n' => {
+                        out.push(b'\n');
+                        self.last_was_newline = true;
+                    }
+                    b'\r' => {
+                        if !self.last_was_newline {
+                            out.push(b'\n');
+                            self.last_was_newline = true;
+                        }
+                    }
+                    b'\t' => {
+                        out.push(b'\t');
+                        self.last_was_newline = false;
+                    }
+                    0x08 => {
+                        let _ = out.pop();
+                        self.last_was_newline = false;
+                    }
+                    b if b >= 0x20 => {
+                        out.push(b);
+                        self.last_was_newline = false;
+                    }
+                    _ => {}
+                },
+                AnsiParseState::Esc => match *byte {
+                    b'[' => self.state = AnsiParseState::Csi,
+                    b']' => self.state = AnsiParseState::Osc,
+                    _ => self.state = AnsiParseState::Text,
+                },
+                AnsiParseState::Csi => {
+                    if (0x40..=0x7e).contains(byte) {
+                        self.state = AnsiParseState::Text;
+                    }
+                }
+                AnsiParseState::Osc => match *byte {
+                    0x07 => self.state = AnsiParseState::Text,
+                    0x1b => self.state = AnsiParseState::OscEsc,
+                    _ => {}
+                },
+                AnsiParseState::OscEsc => match *byte {
+                    b'\\' => self.state = AnsiParseState::Text,
+                    0x1b => {}
+                    _ => self.state = AnsiParseState::Osc,
+                },
+            }
+        }
+        String::from_utf8_lossy(&out).to_string()
+    }
+}
+
+#[cfg(test)]
+mod shell_sanitizer_tests {
+    use super::AnsiSanitizer;
+
+    #[test]
+    fn strips_csi_sequences() {
+        let mut sanitizer = AnsiSanitizer::default();
+        let out = sanitizer.push(b"\x1b[34mblue\x1b[0m plain");
+        assert_eq!(out, "blue plain");
+    }
+
+    #[test]
+    fn handles_split_escape_sequences() {
+        let mut sanitizer = AnsiSanitizer::default();
+        let out1 = sanitizer.push(b"\x1b[3");
+        let out2 = sanitizer.push(b"1mred\x1b[0m");
+        assert_eq!(out1, "");
+        assert_eq!(out2, "red");
+    }
+}
+
+fn write_embedded_shell_bytes(writer: &mut Option<Box<dyn Write + Send>>, bytes: &[u8]) -> bool {
+    let Some(writer) = writer.as_mut() else {
+        return false;
     };
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("kubectl shell exited with {status}"))
+    if writer.write_all(bytes).is_err() {
+        return false;
+    }
+    let _ = writer.flush();
+    true
+}
+
+fn forward_key_to_embedded_shell(
+    key: KeyEvent,
+    writer: &mut Option<Box<dyn Write + Send>>,
+) -> bool {
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_alphabetic() {
+                    let byte = (lower as u8).saturating_sub(b'a').saturating_add(1);
+                    return write_embedded_shell_bytes(writer, &[byte]);
+                }
+                return false;
+            }
+            let mut utf8 = [0u8; 4];
+            let encoded = c.encode_utf8(&mut utf8);
+            write_embedded_shell_bytes(writer, encoded.as_bytes())
+        }
+        KeyCode::Enter => write_embedded_shell_bytes(writer, b"\n"),
+        KeyCode::Backspace => write_embedded_shell_bytes(writer, b"\x7f"),
+        KeyCode::Tab => write_embedded_shell_bytes(writer, b"\t"),
+        KeyCode::Left => write_embedded_shell_bytes(writer, b"\x1b[D"),
+        KeyCode::Right => write_embedded_shell_bytes(writer, b"\x1b[C"),
+        KeyCode::Up => write_embedded_shell_bytes(writer, b"\x1b[A"),
+        KeyCode::Down => write_embedded_shell_bytes(writer, b"\x1b[B"),
+        _ => false,
+    }
+}
+
+async fn stop_embedded_shell(shell: &mut EmbeddedShellState) {
+    shell.writer = None;
+    if let Some(mut child) = shell.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

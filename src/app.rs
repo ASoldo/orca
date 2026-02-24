@@ -31,6 +31,7 @@ pub enum TableOverlayKind {
     Generic,
     PodLogs,
     RelatedLogs,
+    Shell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,6 +412,10 @@ impl App {
         self.table_overlay.is_some()
     }
 
+    pub fn shell_overlay_active(&self) -> bool {
+        self.table_overlay_active() && self.table_overlay_kind == TableOverlayKind::Shell
+    }
+
     pub fn table_overlay_kind(&self) -> Option<TableOverlayKind> {
         self.table_overlay.as_ref().map(|_| self.table_overlay_kind)
     }
@@ -427,6 +432,7 @@ impl App {
             return match self.table_overlay_kind {
                 TableOverlayKind::PodLogs => "log",
                 TableOverlayKind::RelatedLogs => "LOG",
+                TableOverlayKind::Shell => "sh",
                 TableOverlayKind::Generic => "out",
             };
         }
@@ -806,6 +812,36 @@ impl App {
         self.set_table_overlay_with_kind(title, detail, TableOverlayKind::RelatedLogs);
     }
 
+    pub fn set_shell_overlay(&mut self, title: impl Into<String>, detail: String) {
+        self.set_table_overlay_with_kind(title, detail, TableOverlayKind::Shell);
+        self.table_scroll = self.table_max_scroll();
+    }
+
+    pub fn append_shell_output(&mut self, chunk: &str) {
+        if !self.shell_overlay_active() {
+            return;
+        }
+
+        let Some(overlay) = self.table_overlay.as_mut() else {
+            return;
+        };
+
+        overlay.push_str(chunk);
+        const MAX_OVERLAY_CHARS: usize = 500_000;
+        if overlay.chars().count() > MAX_OVERLAY_CHARS {
+            let trimmed = overlay
+                .chars()
+                .rev()
+                .take(MAX_OVERLAY_CHARS)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>();
+            *overlay = trimmed;
+        }
+        self.table_scroll = self.table_max_scroll();
+    }
+
     fn set_table_overlay_with_kind(
         &mut self,
         title: impl Into<String>,
@@ -1039,8 +1075,13 @@ impl App {
                         self.container_picker = Some(previous_picker);
                         self.status = "Back to container list".to_string();
                     } else {
+                        let was_shell = self.shell_overlay_active();
                         self.clear_table_overlay();
-                        self.status = "Closed logs view".to_string();
+                        self.status = if was_shell {
+                            "Closed shell view".to_string()
+                        } else {
+                            "Closed logs view".to_string()
+                        };
                     }
                 } else if self.show_table_overview {
                     self.show_table_overview = false;
@@ -3445,6 +3486,18 @@ mod tests {
         );
         app.set_related_logs_overlay("Logs default/pod-1", "line".to_string());
         assert_eq!(app.pane_label(), "LOG");
+    }
+
+    #[test]
+    fn pane_label_uses_shell_for_embedded_shell_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_shell_overlay("Pod Shell", "# echo hello\nhello\n".to_string());
+        assert_eq!(app.pane_label(), "sh");
+        assert!(app.shell_overlay_active());
     }
 
     #[test]

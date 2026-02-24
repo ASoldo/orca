@@ -18,6 +18,7 @@
   - dashboard overview (`o`)
   - syntax-highlighted details (`d`)
   - logs/output overlay
+  - embedded pod shell overlay (`s`, `:shell`, `:ssh`, `:bash`)
   - pod container picker
 - Watch-based refresh for mapped resources, with periodic refresh fallback
 - Context, cluster, and user switching from kubeconfig
@@ -91,7 +92,7 @@ cargo run --release -- --namespace default --refresh-ms 1500
   - `Deployments/DaemonSets/StatefulSets/ReplicaSets/ReplicationControllers/Jobs/CronJobs -> Pods`
   - `Services -> Pods`
 - `d` opens details mode for the selected row
-- `Esc` goes back one step (logs -> containers -> previous flow/root)
+- `Esc` goes back one step (shell/logs -> containers -> previous flow/root)
 - `o` toggles overview dashboard in the main pane
 
 ## Keybindings
@@ -108,7 +109,7 @@ cargo run --release -- --namespace default --refresh-ms 1500
 - `Enter` (or terminal fallbacks `Ctrl+m` / `Ctrl+j` in input mode): submit input
 - `l`: logs for selected pod/container
 - `Shift+L`: previous/related logs (workload/service aware)
-- `s`: open shell (`/bin/sh`) in selected pod
+- `s`: open embedded shell (`/bin/sh`) in selected pod (inside ORCA)
 - `e`: edit selected resource
 - `p`: prefill `:port-forward ` command
 - `d`: open details view
@@ -185,6 +186,7 @@ Long names (`pods`, `deployments`, `services`, etc.) are also supported.
 - `:scale` executes immediately and refreshes the active resource table
 - `l`/`:logs` are pod/container log focused
 - `Shift+L` resolves related pod logs for workload/service resources
+- `s` / `:shell` / `:ssh` / `:bash` open an embedded shell overlay (`sh` pane label); `Esc` closes it
 - Port-forward sessions are tracked and shown in:
   - `PF` table column for Pods/Services
   - header badge for selected resource

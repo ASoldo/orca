@@ -88,6 +88,7 @@ fn build_left_header_line(app: &App) -> Line<'static> {
         let (icon, label) = match app.table_overlay_kind() {
             Some(TableOverlayKind::PodLogs) => ("󰍩", "logs"),
             Some(TableOverlayKind::RelatedLogs) => ("󰌨", "logs"),
+            Some(TableOverlayKind::Shell) => ("", "shell"),
             _ => (tab_icon(app.active_tab()), "output"),
         };
         format!(
@@ -1630,7 +1631,7 @@ fn render_help_modal(frame: &mut Frame, app: &App) {
             "Resource aliases: po cj ds deploy rs rc sts job svc ing ingclass cm pvc secret sc pv sa role rb crole crb np node event ns crd",
         ),
         Line::from(
-            "Actions: Enter drill-down, d details, Esc back, o overview, l pod logs, Shift+L related logs, s shell, e edit, p port-forward prompt, Tab pane, r refresh, ? help",
+            "Actions: Enter drill-down, d details, Esc back, o overview, l pod logs, Shift+L related logs, s embedded shell, e edit, p port-forward prompt, Tab pane, r refresh, ? help",
         ),
         Line::from("Top bar: compact icon value context; footer uses compact icon segments"),
         Line::from(""),
