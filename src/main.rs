@@ -69,13 +69,15 @@ struct PortForwardExitEvent {
 
 #[derive(Debug, Clone)]
 struct ShellOutputEvent {
-    chunk: String,
+    snapshot: String,
+    application_cursor: bool,
 }
 
 #[derive(Default)]
 struct EmbeddedShellState {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     writer: Option<Box<dyn Write + Send>>,
+    application_cursor: bool,
 }
 
 #[tokio::main]
@@ -221,9 +223,12 @@ async fn run_loop(
                             && app.mode() == app::InputMode::Normal
                             && key.code != KeyCode::Esc
                         {
-                            if forward_key_to_embedded_shell(key, &mut embedded_shell.writer) {
-                                continue;
-                            }
+                            let _ = forward_key_to_embedded_shell(
+                                key,
+                                &mut embedded_shell.writer,
+                                embedded_shell.application_cursor,
+                            );
+                            continue;
                         }
 
                         if let Some(action) = input::map_key(app.mode(), key) {
@@ -287,6 +292,7 @@ async fn run_loop(
                 if should_reset_shell {
                     embedded_shell.child = None;
                     embedded_shell.writer = None;
+                    embedded_shell.application_cursor = false;
                 }
             }
             maybe_tab = watch_rx.recv() => {
@@ -327,7 +333,8 @@ async fn run_loop(
             maybe_shell_output = shell_output_rx.recv() => {
                 if let Some(event) = maybe_shell_output
                     && app.shell_overlay_active() {
-                    app.append_shell_output(&event.chunk);
+                    embedded_shell.application_cursor = event.application_cursor;
+                    app.replace_shell_output(event.snapshot);
                 }
             }
         }
@@ -587,6 +594,7 @@ async fn execute_app_command(
                     spawn_shell_reader(started.reader, shell_output_tx.clone());
                     embedded_shell.child = Some(started.child);
                     embedded_shell.writer = Some(started.writer);
+                    embedded_shell.application_cursor = false;
                     app.set_status(format!(
                         "Embedded shell opened for {namespace}/{pod_name} (Esc to close)"
                     ));
@@ -857,6 +865,13 @@ fn start_embedded_kubectl_shell(
     container: Option<&str>,
     shell: &str,
 ) -> Result<StartedEmbeddedShell> {
+    const AUTO_SHELL_BOOTSTRAP: &str = "export TERM=${TERM:-xterm-256color}; \
+if command -v bash >/dev/null 2>&1; then exec bash -il; \
+elif command -v zsh >/dev/null 2>&1; then exec zsh -il; \
+elif command -v ash >/dev/null 2>&1; then exec ash -i; \
+elif command -v sh >/dev/null 2>&1; then exec sh -i; \
+else exec /bin/sh -i; fi";
+
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
@@ -868,6 +883,7 @@ fn start_embedded_kubectl_shell(
         .context("failed to allocate pseudo-tty for embedded shell")?;
 
     let mut cmd = PtyCommandBuilder::new("kubectl");
+    cmd.env("TERM", "xterm-256color");
     cmd.arg("exec");
     cmd.arg("-i");
     cmd.arg("-t");
@@ -879,8 +895,14 @@ fn start_embedded_kubectl_shell(
         cmd.arg(container);
     }
     cmd.arg("--");
-    cmd.arg(shell);
-    cmd.arg("-i");
+    if shell.eq_ignore_ascii_case("auto") {
+        cmd.arg("sh");
+        cmd.arg("-lc");
+        cmd.arg(AUTO_SHELL_BOOTSTRAP);
+    } else {
+        cmd.arg(shell);
+        cmd.arg("-i");
+    }
 
     let child = pty_pair
         .slave
@@ -908,20 +930,24 @@ fn spawn_shell_reader(
     tx: mpsc::UnboundedSender<ShellOutputEvent>,
 ) {
     std::thread::spawn(move || {
+        let mut parser = vt100::Parser::new(200, 240, 4_000);
         let mut buffer = vec![0u8; 4096];
-        let mut sanitizer = AnsiSanitizer::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    let chunk = sanitizer.push(&buffer[..read]);
-                    if !chunk.is_empty() {
-                        let _ = tx.send(ShellOutputEvent { chunk });
-                    }
+                    parser.process(&buffer[..read]);
+                    let snapshot = render_shell_snapshot(parser.screen());
+                    let application_cursor = parser.screen().application_cursor();
+                    let _ = tx.send(ShellOutputEvent {
+                        snapshot,
+                        application_cursor,
+                    });
                 }
                 Err(error) => {
                     let _ = tx.send(ShellOutputEvent {
-                        chunk: format!("\n[orca] shell stream error: {error}\n"),
+                        snapshot: format!("[orca] shell stream error: {error}"),
+                        application_cursor: false,
                     });
                     break;
                 }
@@ -930,105 +956,55 @@ fn spawn_shell_reader(
     });
 }
 
-#[derive(Debug, Clone, Copy)]
-enum AnsiParseState {
-    Text,
-    Esc,
-    Csi,
-    Osc,
-    OscEsc,
-}
+fn render_shell_snapshot(screen: &vt100::Screen) -> String {
+    let (rows, cols) = screen.size();
+    let mut lines = screen
+        .rows(0, cols)
+        .take(rows as usize)
+        .collect::<Vec<String>>();
 
-#[derive(Debug)]
-struct AnsiSanitizer {
-    state: AnsiParseState,
-    last_was_newline: bool,
-}
-
-impl Default for AnsiSanitizer {
-    fn default() -> Self {
-        Self {
-            state: AnsiParseState::Text,
-            last_was_newline: false,
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    if let Some(line) = lines.get_mut(cursor_row as usize) {
+        let mut chars = line.chars().collect::<Vec<char>>();
+        let cursor_index = cursor_col as usize;
+        if cursor_index >= chars.len() {
+            chars.resize(cursor_index, ' ');
+            chars.push('█');
+        } else {
+            chars[cursor_index] = '█';
         }
+        *line = chars.into_iter().collect();
     }
-}
 
-impl AnsiSanitizer {
-    fn push(&mut self, bytes: &[u8]) -> String {
-        let mut out = Vec::with_capacity(bytes.len());
-        for byte in bytes {
-            match self.state {
-                AnsiParseState::Text => match *byte {
-                    0x1b => self.state = AnsiParseState::Esc,
-                    b'\n' => {
-                        out.push(b'\n');
-                        self.last_was_newline = true;
-                    }
-                    b'\r' => {
-                        if !self.last_was_newline {
-                            out.push(b'\n');
-                            self.last_was_newline = true;
-                        }
-                    }
-                    b'\t' => {
-                        out.push(b'\t');
-                        self.last_was_newline = false;
-                    }
-                    0x08 => {
-                        let _ = out.pop();
-                        self.last_was_newline = false;
-                    }
-                    b if b >= 0x20 => {
-                        out.push(b);
-                        self.last_was_newline = false;
-                    }
-                    _ => {}
-                },
-                AnsiParseState::Esc => match *byte {
-                    b'[' => self.state = AnsiParseState::Csi,
-                    b']' => self.state = AnsiParseState::Osc,
-                    _ => self.state = AnsiParseState::Text,
-                },
-                AnsiParseState::Csi => {
-                    if (0x40..=0x7e).contains(byte) {
-                        self.state = AnsiParseState::Text;
-                    }
-                }
-                AnsiParseState::Osc => match *byte {
-                    0x07 => self.state = AnsiParseState::Text,
-                    0x1b => self.state = AnsiParseState::OscEsc,
-                    _ => {}
-                },
-                AnsiParseState::OscEsc => match *byte {
-                    b'\\' => self.state = AnsiParseState::Text,
-                    0x1b => {}
-                    _ => self.state = AnsiParseState::Osc,
-                },
-            }
-        }
-        String::from_utf8_lossy(&out).to_string()
+    while lines.last().is_some_and(|line| line.trim_end().is_empty()) {
+        lines.pop();
     }
+
+    lines.join("\n")
 }
 
 #[cfg(test)]
-mod shell_sanitizer_tests {
-    use super::AnsiSanitizer;
+mod shell_snapshot_tests {
+    use super::render_shell_snapshot;
 
     #[test]
-    fn strips_csi_sequences() {
-        let mut sanitizer = AnsiSanitizer::default();
-        let out = sanitizer.push(b"\x1b[34mblue\x1b[0m plain");
-        assert_eq!(out, "blue plain");
+    fn renders_block_cursor_without_raw_escape_bytes() {
+        let mut parser = vt100::Parser::new(8, 40, 32);
+        parser.process(b"\x1b[32mhello\x1b[0m");
+        let rendered = render_shell_snapshot(parser.screen());
+        assert!(rendered.contains("hello"));
+        assert!(rendered.contains('█'));
+        assert!(!rendered.contains("\x1b"));
     }
 
     #[test]
-    fn handles_split_escape_sequences() {
-        let mut sanitizer = AnsiSanitizer::default();
-        let out1 = sanitizer.push(b"\x1b[3");
-        let out2 = sanitizer.push(b"1mred\x1b[0m");
-        assert_eq!(out1, "");
-        assert_eq!(out2, "red");
+    fn trims_trailing_blank_lines() {
+        let mut parser = vt100::Parser::new(8, 40, 32);
+        parser.process(b"line1\nline2");
+        let rendered = render_shell_snapshot(parser.screen());
+        assert!(rendered.contains("line1"));
+        assert!(rendered.contains("line2"));
+        assert!(!rendered.ends_with('\n'));
     }
 }
 
@@ -1047,34 +1023,99 @@ fn write_embedded_shell_bytes(writer: &mut Option<Box<dyn Write + Send>>, bytes:
 fn forward_key_to_embedded_shell(
     key: KeyEvent,
     writer: &mut Option<Box<dyn Write + Send>>,
+    application_cursor: bool,
 ) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
     match key.code {
         KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if control {
                 let lower = c.to_ascii_lowercase();
                 if lower.is_ascii_alphabetic() {
                     let byte = (lower as u8).saturating_sub(b'a').saturating_add(1);
                     return write_embedded_shell_bytes(writer, &[byte]);
                 }
+                if c == ' ' {
+                    return write_embedded_shell_bytes(writer, &[0x00]);
+                }
                 return false;
             }
             let mut utf8 = [0u8; 4];
             let encoded = c.encode_utf8(&mut utf8);
-            write_embedded_shell_bytes(writer, encoded.as_bytes())
+            if alt {
+                let mut prefixed = vec![0x1b];
+                prefixed.extend_from_slice(encoded.as_bytes());
+                write_embedded_shell_bytes(writer, &prefixed)
+            } else {
+                write_embedded_shell_bytes(writer, encoded.as_bytes())
+            }
         }
-        KeyCode::Enter => write_embedded_shell_bytes(writer, b"\n"),
+        KeyCode::Enter => write_embedded_shell_bytes(writer, b"\r"),
         KeyCode::Backspace => write_embedded_shell_bytes(writer, b"\x7f"),
         KeyCode::Tab => write_embedded_shell_bytes(writer, b"\t"),
-        KeyCode::Left => write_embedded_shell_bytes(writer, b"\x1b[D"),
-        KeyCode::Right => write_embedded_shell_bytes(writer, b"\x1b[C"),
-        KeyCode::Up => write_embedded_shell_bytes(writer, b"\x1b[A"),
-        KeyCode::Down => write_embedded_shell_bytes(writer, b"\x1b[B"),
+        KeyCode::BackTab => write_embedded_shell_bytes(writer, b"\x1b[Z"),
+        KeyCode::Left if control => write_embedded_shell_bytes(writer, b"\x1b[1;5D"),
+        KeyCode::Right if control => write_embedded_shell_bytes(writer, b"\x1b[1;5C"),
+        KeyCode::Left => {
+            let seq = if application_cursor {
+                b"\x1bOD"
+            } else {
+                b"\x1b[D"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::Right => {
+            let seq = if application_cursor {
+                b"\x1bOC"
+            } else {
+                b"\x1b[C"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::Up => {
+            let seq = if application_cursor {
+                b"\x1bOA"
+            } else {
+                b"\x1b[A"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::Down => {
+            let seq = if application_cursor {
+                b"\x1bOB"
+            } else {
+                b"\x1b[B"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::Home => {
+            let seq = if application_cursor {
+                b"\x1bOH"
+            } else {
+                b"\x1b[H"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::End => {
+            let seq = if application_cursor {
+                b"\x1bOF"
+            } else {
+                b"\x1b[F"
+            };
+            write_embedded_shell_bytes(writer, seq)
+        }
+        KeyCode::Delete => write_embedded_shell_bytes(writer, b"\x1b[3~"),
+        KeyCode::Insert => write_embedded_shell_bytes(writer, b"\x1b[2~"),
+        KeyCode::PageUp => write_embedded_shell_bytes(writer, b"\x1b[5~"),
+        KeyCode::PageDown => write_embedded_shell_bytes(writer, b"\x1b[6~"),
         _ => false,
     }
 }
 
 async fn stop_embedded_shell(shell: &mut EmbeddedShellState) {
     shell.writer = None;
+    shell.application_cursor = false;
     if let Some(mut child) = shell.child.take() {
         let _ = child.kill();
         let _ = child.wait();

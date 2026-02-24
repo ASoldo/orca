@@ -771,6 +771,11 @@ impl KubeGateway {
                     .as_ref()
                     .and_then(|value| value.phase.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
+                let node = pod
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.node_name.clone())
+                    .unwrap_or_else(|| "-".to_string());
                 let (ready, total, restarts) =
                     pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
                 let age = human_age(pod.metadata.creation_timestamp.as_ref());
@@ -781,6 +786,7 @@ impl KubeGateway {
                     columns: vec![
                         name,
                         namespace.unwrap_or_else(|| "-".to_string()),
+                        node,
                         format!("{ready}/{total}"),
                         status,
                         restarts.to_string(),
@@ -795,6 +801,7 @@ impl KubeGateway {
             vec![
                 "Name".to_string(),
                 "Namespace".to_string(),
+                "Node".to_string(),
                 "Ready".to_string(),
                 "Status".to_string(),
                 "Restarts".to_string(),

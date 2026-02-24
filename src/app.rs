@@ -842,6 +842,19 @@ impl App {
         self.table_scroll = self.table_max_scroll();
     }
 
+    pub fn replace_shell_output(&mut self, snapshot: String) {
+        if !self.shell_overlay_active() {
+            return;
+        }
+
+        let Some(overlay) = self.table_overlay.as_mut() else {
+            return;
+        };
+
+        *overlay = snapshot;
+        self.table_scroll = self.table_max_scroll();
+    }
+
     fn set_table_overlay_with_kind(
         &mut self,
         title: impl Into<String>,
@@ -1037,7 +1050,7 @@ impl App {
             }
             Action::LoadPodLogs => self.create_logs_command(false),
             Action::LoadResourceLogs => self.create_related_logs_command(true),
-            Action::OpenPodShell => self.prepare_shell_command(None, "/bin/sh".to_string()),
+            Action::OpenPodShell => self.prepare_shell_command(None, "auto".to_string()),
             Action::EditResource => self.prepare_edit_command(),
             Action::StartPortForwardPrompt => {
                 self.mode = InputMode::Command;
@@ -1642,6 +1655,7 @@ impl App {
             "scale ".to_string(),
             "exec ".to_string(),
             "shell".to_string(),
+            "shell auto".to_string(),
             "shell /bin/sh".to_string(),
             "shell /bin/bash".to_string(),
             "bash".to_string(),
@@ -2904,12 +2918,12 @@ fn parse_namespace_target(input: &str) -> String {
 
 fn parse_shell_args(args: Vec<String>) -> (Option<String>, String) {
     match args.as_slice() {
-        [] => (None, "/bin/sh".to_string()),
+        [] => (None, "auto".to_string()),
         [single] => {
             if is_shell_token(single) {
                 (None, normalize_shell_token(single))
             } else {
-                (Some(single.clone()), "/bin/sh".to_string())
+                (Some(single.clone()), "auto".to_string())
             }
         }
         [container, shell, ..] => (Some(container.clone()), normalize_shell_token(shell)),
@@ -2917,13 +2931,14 @@ fn parse_shell_args(args: Vec<String>) -> (Option<String>, String) {
 }
 
 fn is_shell_token(token: &str) -> bool {
-    matches!(token, "sh" | "bash") || token.starts_with('/')
+    matches!(token, "sh" | "bash" | "auto") || token.starts_with('/')
 }
 
 fn normalize_shell_token(token: &str) -> String {
     match token {
         "sh" => "/bin/sh".to_string(),
         "bash" => "/bin/bash".to_string(),
+        "auto" => "auto".to_string(),
         _ => token.to_string(),
     }
 }
