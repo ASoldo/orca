@@ -1618,7 +1618,7 @@ fn render_help_modal(frame: &mut Frame, app: &App) {
         Line::from("orca keymap"),
         Line::from(""),
         Line::from(
-            "Navigation: j/k (up/down), gg/G (top/bottom), Ctrl+u/Ctrl+d (jump), Ctrl+0..9 (views), Left/Right or resource aliases",
+            "Navigation: j/k (up/down), gg/G (top/bottom), Ctrl+u/Ctrl+d (jump), Ctrl+0..9 (views), Ctrl+Alt+0..9 (delete view), Left/Right or resource aliases",
         ),
         Line::from(
             "Modes: / (filter), : (command), > (jump), Tab (autocomplete), Esc (cancel), Enter (submit input)",

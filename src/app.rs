@@ -1117,6 +1117,7 @@ impl App {
                 AppCommand::None
             }
             Action::SwitchView(slot) => self.switch_view_slot(slot as usize),
+            Action::DeleteView(slot) => self.delete_view_slot(slot as usize),
         }
     }
 
@@ -1465,6 +1466,58 @@ impl App {
         self.completion_index = 0;
         self.pending_g = false;
         self.status = format!("Switched to view {slot} (refreshing)");
+        AppCommand::RefreshActive
+    }
+
+    fn delete_view_slot(&mut self, slot: usize) -> AppCommand {
+        if slot >= self.view_slots.len() {
+            self.status = format!("Invalid view slot {slot}");
+            return AppCommand::None;
+        }
+
+        if slot != self.active_view_slot {
+            if self.view_slots[slot].is_none() {
+                self.status = format!("View {slot} is already empty");
+                return AppCommand::None;
+            }
+            self.view_slots[slot] = None;
+            self.status = format!("Deleted view {slot}");
+            return AppCommand::None;
+        }
+
+        let mut fallback_slots = self
+            .view_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, state)| (index != slot && state.is_some()).then_some(index))
+            .collect::<Vec<_>>();
+        fallback_slots.sort_unstable();
+
+        let Some(fallback) = fallback_slots
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == 1)
+            .or_else(|| fallback_slots.first().copied())
+        else {
+            self.status =
+                format!("Cannot delete active view {slot}: at least one view must remain");
+            return AppCommand::None;
+        };
+
+        let Some(target_state) = self.view_slots[fallback].clone() else {
+            self.status = format!("View {fallback} has no state to switch to");
+            return AppCommand::None;
+        };
+
+        self.view_slots[slot] = None;
+        self.active_view_slot = fallback;
+        self.apply_view_state(&target_state);
+        self.view_slots[fallback] = Some(self.capture_view_state());
+        self.mode = InputMode::Normal;
+        self.input.clear();
+        self.completion_index = 0;
+        self.pending_g = false;
+        self.status = format!("Deleted view {slot}; switched to {fallback}");
         AppCommand::RefreshActive
     }
 
@@ -3598,6 +3651,58 @@ mod tests {
         assert_eq!(app.active_view_slot(), 1);
         assert_eq!(app.active_tab(), ResourceTab::Deployments);
         assert_eq!(app.filter(), "web");
+    }
+
+    #[test]
+    fn deleting_inactive_view_slot_clears_it() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        let _ = app.apply_action(Action::SwitchView(2));
+        assert_eq!(app.active_view_slot(), 2);
+        assert!(app.view_slot_initialized(1));
+        assert!(app.view_slot_initialized(2));
+
+        let cmd = app.apply_action(Action::DeleteView(1));
+        assert_eq!(cmd, AppCommand::None);
+        assert_eq!(app.active_view_slot(), 2);
+        assert!(!app.view_slot_initialized(1));
+        assert!(app.view_slot_initialized(2));
+    }
+
+    #[test]
+    fn deleting_active_view_slot_switches_to_fallback() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        let _ = app.apply_action(Action::SwitchView(2));
+        assert_eq!(app.active_view_slot(), 2);
+
+        let cmd = app.apply_action(Action::DeleteView(2));
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_view_slot(), 1);
+        assert!(!app.view_slot_initialized(2));
+        assert!(app.view_slot_initialized(1));
+    }
+
+    #[test]
+    fn deleting_last_active_view_is_rejected() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        let cmd = app.apply_action(Action::DeleteView(1));
+        assert_eq!(cmd, AppCommand::None);
+        assert_eq!(app.active_view_slot(), 1);
+        assert!(app.view_slot_initialized(1));
     }
 
     #[test]

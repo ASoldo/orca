@@ -39,6 +39,7 @@ pub enum Action {
     ConfirmYes,
     ConfirmNo,
     SwitchView(u8),
+    DeleteView(u8),
 }
 
 pub fn map_key(mode: InputMode, key: KeyEvent) -> Option<Action> {
@@ -110,6 +111,12 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
             Some(Action::PageDown)
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Action::PageUp),
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            map_digit_number(c).map(Action::DeleteView)
+        }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             map_ctrl_number(c).map(Action::SwitchView)
         }
@@ -122,9 +129,6 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
             Some(Action::SwitchView(8))
         }
         KeyCode::Backspace if key.modifiers.is_empty() => Some(Action::SwitchView(8)),
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) && c.is_ascii_digit() => {
-            Some(Action::SwitchView(c.to_digit(10).unwrap_or(0) as u8))
-        }
         _ => None,
     }
 }
@@ -132,7 +136,15 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
 fn map_ctrl_number(c: char) -> Option<u8> {
     match c {
         '0'..='9' => Some(c.to_digit(10).unwrap_or(0) as u8),
+        '!' => Some(1),
         '@' => Some(2),
+        '#' => Some(3),
+        '$' => Some(4),
+        '%' => Some(5),
+        '&' => Some(7),
+        '*' => Some(8),
+        '(' => Some(9),
+        ')' => Some(0),
         ' ' => Some(0),
         'a' => Some(1),
         'b' => Some(2),
@@ -143,6 +155,14 @@ fn map_ctrl_number(c: char) -> Option<u8> {
         '_' => Some(7),
         'h' => Some(8),
         'i' => Some(9),
+        _ => None,
+    }
+}
+
+fn map_digit_number(c: char) -> Option<u8> {
+    match c {
+        '0'..='9' => Some(c.to_digit(10).unwrap_or(0) as u8),
+        ')' => Some(0),
         _ => None,
     }
 }
@@ -191,11 +211,14 @@ fn map_input_mode_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             Some(Action::PrevSuggestion)
         }
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            map_digit_number(c).map(Action::DeleteView)
+        }
         KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
             map_ctrl_number(c).map(Action::SwitchView)
-        }
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::ALT) && c.is_ascii_digit() => {
-            Some(Action::SwitchView(c.to_digit(10).unwrap_or(0) as u8))
         }
         _ => None,
     }
@@ -370,9 +393,50 @@ mod tests {
     }
 
     #[test]
-    fn input_mode_maps_alt_digit_to_view_switch() {
-        let key = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::ALT);
+    fn input_mode_maps_ctrl_shift_digit_symbols_to_view_switch() {
+        let ctrl_shift_1 = KeyEvent::new(
+            KeyCode::Char('!'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_shift_5 = KeyEvent::new(
+            KeyCode::Char('%'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        let ctrl_shift_9 = KeyEvent::new(
+            KeyCode::Char('('),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            map_key(InputMode::Command, ctrl_shift_1),
+            Some(Action::SwitchView(1))
+        );
+        assert_eq!(
+            map_key(InputMode::Command, ctrl_shift_5),
+            Some(Action::SwitchView(5))
+        );
+        assert_eq!(
+            map_key(InputMode::Command, ctrl_shift_9),
+            Some(Action::SwitchView(9))
+        );
+    }
+
+    #[test]
+    fn normal_mode_maps_ctrl_alt_digit_to_delete_view() {
+        let key = KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let action = map_key(InputMode::Normal, key);
+        assert_eq!(action, Some(Action::DeleteView(4)));
+    }
+
+    #[test]
+    fn input_mode_maps_ctrl_alt_digit_to_delete_view() {
+        let key = KeyEvent::new(
+            KeyCode::Char('7'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
         let action = map_key(InputMode::Command, key);
-        assert_eq!(action, Some(Action::SwitchView(4)));
+        assert_eq!(action, Some(Action::DeleteView(7)));
     }
 }

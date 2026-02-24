@@ -120,9 +120,10 @@ cargo run --release -- --namespace default --refresh-ms 1500
 
 ### View slots
 
-- `Ctrl+0..9` switches/creates view slots
-- `0..9` also switches view slots in normal mode
-- `Alt+0..9` switches view slots in input modes
+- `Ctrl+1..9` switches/creates view slots
+- `1..9` also switches view slots in normal mode
+- `Ctrl+Shift+1..9` switches view slots in input modes
+- `Ctrl+Alt+0..9` deletes a view slot
 - View state is preserved per slot (tab, scope, filter, overlays, selection)
 
 ## Command mode (`:`)
