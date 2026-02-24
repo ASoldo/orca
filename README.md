@@ -1,4 +1,9 @@
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/5cf48dd3-55aa-46f4-bb01-eca2730632f7" />
+
 # orca
+
+<img width="953" height="515" alt="image" src="https://github.com/user-attachments/assets/5b5bc695-36fd-4168-bcad-eaca5f921c08" />
+
 
 `orca` is a Kubernetes terminal cockpit inspired by `k9s`, built in Rust with `ratatui`.
 
