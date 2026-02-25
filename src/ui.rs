@@ -1646,7 +1646,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
         "Catalog: :ctx list/switch  :cluster list/switch  :usr list/switch  :ns list/scope"
             .to_string(),
     );
-    lines.push("Ops: :tools checks local DevOps CLI readiness and versions".to_string());
+    lines.push("Ops: :tools  :argocd  :helm  :tf  :ansible  :docker  :oc  :kustomize".to_string());
     lines.push("Input: : command  > jump  / filter  Tab autocomplete  Ctrl+u/d page".to_string());
     lines.push(String::new());
 

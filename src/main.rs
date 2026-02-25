@@ -6,7 +6,7 @@ mod model;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, AppCommand};
+use app::{App, AppCommand, OpsInspectTarget};
 use clap::Parser;
 use cli::CliArgs;
 use crossterm::event::{
@@ -675,6 +675,11 @@ async fn execute_app_command(
             app.set_output_overlay("Toolchain Inventory", report);
             app.set_status("Toolchain inventory refreshed");
         }
+        AppCommand::InspectOps { target } => {
+            let (title, report, status) = inspect_ops_target(target, app.namespace_scope()).await;
+            app.set_output_overlay(title, report);
+            app.set_status(status);
+        }
         AppCommand::SwitchContext { context } => match gateway.switch_context(&context).await {
             Ok(()) => {
                 app.set_kube_target(
@@ -895,6 +900,353 @@ fn fit_text(input: &str, max_chars: usize) -> String {
         .collect::<String>();
     out.push('…');
     out
+}
+
+async fn inspect_ops_target(
+    target: OpsInspectTarget,
+    namespace_scope: &NamespaceScope,
+) -> (String, String, String) {
+    match target {
+        OpsInspectTarget::ArgoCdApps => {
+            let args = vec!["app".to_string(), "list".to_string()];
+            match run_external_readonly("argocd", &args, 6).await {
+                Ok(output) => (
+                    "Argo CD Applications".to_string(),
+                    bounded_output(&output, 220, 220),
+                    "Argo CD application catalog loaded".to_string(),
+                ),
+                Err(error) => (
+                    "Argo CD Applications".to_string(),
+                    error,
+                    "Argo CD application catalog failed".to_string(),
+                ),
+            }
+        }
+        OpsInspectTarget::ArgoCdApp { name } => {
+            let args = vec!["app".to_string(), "get".to_string(), name.clone()];
+            match run_external_readonly("argocd", &args, 6).await {
+                Ok(output) => (
+                    format!("Argo CD App {}", name),
+                    bounded_output(&output, 260, 220),
+                    format!("Argo CD app loaded: {name}"),
+                ),
+                Err(error) => (
+                    format!("Argo CD App {}", name),
+                    error,
+                    format!("Argo CD app lookup failed: {name}"),
+                ),
+            }
+        }
+        OpsInspectTarget::HelmReleases => {
+            let args = vec!["list".to_string(), "-A".to_string()];
+            match run_external_readonly("helm", &args, 6).await {
+                Ok(output) => (
+                    "Helm Releases".to_string(),
+                    bounded_output(&output, 220, 220),
+                    "Helm release list loaded".to_string(),
+                ),
+                Err(error) => (
+                    "Helm Releases".to_string(),
+                    error,
+                    "Helm release list failed".to_string(),
+                ),
+            }
+        }
+        OpsInspectTarget::HelmRelease { name } => {
+            let mut args = vec!["status".to_string(), name.clone()];
+            if let NamespaceScope::Named(namespace) = namespace_scope {
+                args.push("-n".to_string());
+                args.push(namespace.clone());
+            }
+            match run_external_readonly("helm", &args, 6).await {
+                Ok(output) => (
+                    format!("Helm Release {}", name),
+                    bounded_output(&output, 280, 220),
+                    format!("Helm release loaded: {name}"),
+                ),
+                Err(error) => (
+                    format!("Helm Release {}", name),
+                    error,
+                    format!("Helm release lookup failed: {name}"),
+                ),
+            }
+        }
+        OpsInspectTarget::TerraformOverview => {
+            let mut sections = Vec::new();
+            sections.push(
+                match run_external_readonly(
+                    "terraform",
+                    &["workspace".to_string(), "show".to_string()],
+                    5,
+                )
+                .await
+                {
+                    Ok(output) => format!("workspace(show)\n{}", bounded_output(&output, 12, 220)),
+                    Err(error) => format!("workspace(show)\n{error}"),
+                },
+            );
+            sections.push(
+                match run_external_readonly(
+                    "terraform",
+                    &["workspace".to_string(), "list".to_string()],
+                    5,
+                )
+                .await
+                {
+                    Ok(output) => format!("workspace(list)\n{}", bounded_output(&output, 80, 220)),
+                    Err(error) => format!("workspace(list)\n{error}"),
+                },
+            );
+            sections.push(
+                match run_external_readonly(
+                    "terraform",
+                    &["state".to_string(), "list".to_string()],
+                    6,
+                )
+                .await
+                {
+                    Ok(output) => format!("state(list)\n{}", bounded_output(&output, 140, 220)),
+                    Err(error) => format!("state(list)\n{error}"),
+                },
+            );
+            (
+                "Terraform Overview".to_string(),
+                sections.join("\n\n"),
+                "Terraform overview loaded".to_string(),
+            )
+        }
+        OpsInspectTarget::AnsibleOverview => {
+            let version = match run_external_readonly(
+                "ansible-playbook",
+                &["--version".to_string()],
+                5,
+            )
+            .await
+            {
+                Ok(output) => format!("ansible-playbook\n{}", bounded_output(&output, 14, 220)),
+                Err(error) => format!("ansible-playbook\n{error}"),
+            };
+
+            let playbooks = discover_ansible_playbooks(".", 6, 220);
+            let playbook_lines = if playbooks.is_empty() {
+                "No playbook-like files found under current path".to_string()
+            } else {
+                playbooks
+                    .into_iter()
+                    .map(|entry| fit_text(&entry, 220))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            (
+                "Ansible Overview".to_string(),
+                format!("{version}\n\nplaybooks\n{playbook_lines}"),
+                "Ansible overview loaded".to_string(),
+            )
+        }
+        OpsInspectTarget::DockerOverview => {
+            let ps = match run_external_readonly(
+                "docker",
+                &[
+                    "ps".to_string(),
+                    "--format".to_string(),
+                    "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}".to_string(),
+                ],
+                6,
+            )
+            .await
+            {
+                Ok(output) => format!("containers\n{}", bounded_output(&output, 80, 220)),
+                Err(error) => format!("containers\n{error}"),
+            };
+
+            let images = match run_external_readonly(
+                "docker",
+                &[
+                    "images".to_string(),
+                    "--format".to_string(),
+                    "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}".to_string(),
+                ],
+                6,
+            )
+            .await
+            {
+                Ok(output) => format!("images\n{}", bounded_output(&output, 80, 220)),
+                Err(error) => format!("images\n{error}"),
+            };
+
+            (
+                "Docker Overview".to_string(),
+                format!("{ps}\n\n{images}"),
+                "Docker overview loaded".to_string(),
+            )
+        }
+        OpsInspectTarget::OpenShiftProjects => {
+            let current = match run_external_readonly("oc", &["project".to_string()], 6).await {
+                Ok(output) => format!("current\n{}", bounded_output(&output, 18, 220)),
+                Err(error) => format!("current\n{error}"),
+            };
+
+            let projects = match run_external_readonly("oc", &["projects".to_string()], 6).await {
+                Ok(output) => format!("projects\n{}", bounded_output(&output, 160, 220)),
+                Err(error) => format!("projects\n{error}"),
+            };
+
+            (
+                "OpenShift Projects".to_string(),
+                format!("{current}\n\n{projects}"),
+                "OpenShift project inventory loaded".to_string(),
+            )
+        }
+        OpsInspectTarget::KustomizeBuild { path } => {
+            let args = vec!["build".to_string(), path.clone()];
+            match run_external_readonly("kustomize", &args, 8).await {
+                Ok(output) => (
+                    format!("Kustomize Build {}", path),
+                    bounded_output(&output, 240, 220),
+                    format!("Kustomize build preview loaded: {path}"),
+                ),
+                Err(error) => (
+                    format!("Kustomize Build {}", path),
+                    error,
+                    format!("Kustomize build preview failed: {path}"),
+                ),
+            }
+        }
+    }
+}
+
+async fn run_external_readonly(
+    program: &str,
+    args: &[String],
+    timeout_secs: u64,
+) -> std::result::Result<String, String> {
+    let mut cmd = TokioCommand::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| format!("{program} timed out after {timeout_secs}s"))?
+        .map_err(|error| format!("{program}: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let rendered = if stdout.is_empty() {
+        stderr.clone()
+    } else if stderr.is_empty() {
+        stdout.clone()
+    } else {
+        format!("{stdout}\n\nstderr:\n{stderr}")
+    };
+
+    if output.status.success() {
+        Ok(rendered)
+    } else if rendered.is_empty() {
+        Err(format!("{program} exited with {}", output.status))
+    } else {
+        Err(format!(
+            "{program} failed:\n{}",
+            bounded_output(&rendered, 80, 220)
+        ))
+    }
+}
+
+fn bounded_output(input: &str, max_lines: usize, max_line_chars: usize) -> String {
+    let mut lines = input
+        .lines()
+        .map(|line| fit_text(line, max_line_chars))
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return "(no output)".to_string();
+    }
+
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        lines.push("…".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn discover_ansible_playbooks(root: &str, max_depth: usize, max_files: usize) -> Vec<String> {
+    fn walk(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        depth: usize,
+        max_depth: usize,
+        max_files: usize,
+        out: &mut Vec<String>,
+    ) {
+        if depth > max_depth || out.len() >= max_files {
+            return;
+        }
+
+        let entries = match std::fs::read_dir(current) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            if out.len() >= max_files {
+                return;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == ".git" {
+                continue;
+            }
+
+            if path.is_dir() {
+                walk(
+                    root,
+                    &path,
+                    depth.saturating_add(1),
+                    max_depth,
+                    max_files,
+                    out,
+                );
+                continue;
+            }
+
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if ext != "yml" && ext != "yaml" {
+                continue;
+            }
+
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let full = path.to_string_lossy().to_ascii_lowercase();
+            let looks_like_playbook = stem.contains("playbook")
+                || stem == "site"
+                || full.contains("/ansible/")
+                || full.contains("/playbooks/");
+            if !looks_like_playbook {
+                continue;
+            }
+
+            if let Ok(relative) = path.strip_prefix(root) {
+                out.push(relative.display().to_string());
+            } else {
+                out.push(path.display().to_string());
+            }
+        }
+    }
+
+    let root_path = std::path::Path::new(root);
+    let mut found = Vec::new();
+    walk(root_path, root_path, 0, max_depth, max_files, &mut found);
+    found.sort();
+    found.dedup();
+    found
 }
 
 async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {

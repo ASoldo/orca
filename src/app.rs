@@ -35,6 +35,19 @@ pub enum TableOverlayKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpsInspectTarget {
+    ArgoCdApps,
+    ArgoCdApp { name: String },
+    HelmReleases,
+    HelmRelease { name: String },
+    TerraformOverview,
+    AnsibleOverview,
+    DockerOverview,
+    OpenShiftProjects,
+    KustomizeBuild { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     None,
     RefreshActive,
@@ -105,6 +118,9 @@ pub enum AppCommand {
         user: String,
     },
     InspectTooling,
+    InspectOps {
+        target: OpsInspectTarget,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1619,7 +1635,20 @@ impl App {
     fn command_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "help".to_string(),
+            "ops".to_string(),
             "tools".to_string(),
+            "argocd".to_string(),
+            "argocd ".to_string(),
+            "helm".to_string(),
+            "helm ".to_string(),
+            "tf".to_string(),
+            "terraform".to_string(),
+            "ansible".to_string(),
+            "docker".to_string(),
+            "oc".to_string(),
+            "openshift".to_string(),
+            "kustomize".to_string(),
+            "kustomize .".to_string(),
             "refresh".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
@@ -1694,6 +1723,15 @@ impl App {
 
     fn jump_completions(&self) -> Vec<String> {
         let mut candidates = vec![
+            "ops".to_string(),
+            "tools".to_string(),
+            "argocd".to_string(),
+            "helm".to_string(),
+            "tf".to_string(),
+            "ansible".to_string(),
+            "docker".to_string(),
+            "oc".to_string(),
+            "kustomize .".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
             "cl ".to_string(),
@@ -2009,7 +2047,52 @@ impl App {
                 self.status = "Exit requested".to_string();
                 AppCommand::None
             }
+            "ops" => AppCommand::InspectTooling,
             "tools" => AppCommand::InspectTooling,
+            "argocd" | "argo" => {
+                if let Some(name) = parts.next() {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::ArgoCdApp {
+                            name: name.to_string(),
+                        },
+                    }
+                } else {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::ArgoCdApps,
+                    }
+                }
+            }
+            "helm" => {
+                if let Some(name) = parts.next() {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::HelmRelease {
+                            name: name.to_string(),
+                        },
+                    }
+                } else {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::HelmReleases,
+                    }
+                }
+            }
+            "tf" | "terraform" => AppCommand::InspectOps {
+                target: OpsInspectTarget::TerraformOverview,
+            },
+            "ansible" | "ans" => AppCommand::InspectOps {
+                target: OpsInspectTarget::AnsibleOverview,
+            },
+            "docker" => AppCommand::InspectOps {
+                target: OpsInspectTarget::DockerOverview,
+            },
+            "oc" | "openshift" => AppCommand::InspectOps {
+                target: OpsInspectTarget::OpenShiftProjects,
+            },
+            "kustomize" | "kustom" => {
+                let path = parts.next().unwrap_or(".").to_string();
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::KustomizeBuild { path },
+                }
+            }
             "refresh" | "reload" | "r" => AppCommand::RefreshActive,
             "ctx" | "context" | "use-context" => {
                 let Some(context) = parts.next() else {
@@ -2166,6 +2249,73 @@ impl App {
 
         let mut parts = jump.split_whitespace();
         let first = resolve_command_token(parts.next().unwrap_or_default());
+        if first == "ops" {
+            return AppCommand::InspectTooling;
+        }
+
+        if first == "tools" {
+            return AppCommand::InspectTooling;
+        }
+
+        if matches!(first.as_str(), "argocd" | "argo") {
+            return if let Some(name) = parts.next() {
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::ArgoCdApp {
+                        name: name.to_string(),
+                    },
+                }
+            } else {
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::ArgoCdApps,
+                }
+            };
+        }
+
+        if first == "helm" {
+            return if let Some(name) = parts.next() {
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::HelmRelease {
+                        name: name.to_string(),
+                    },
+                }
+            } else {
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::HelmReleases,
+                }
+            };
+        }
+
+        if matches!(first.as_str(), "tf" | "terraform") {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::TerraformOverview,
+            };
+        }
+
+        if matches!(first.as_str(), "ansible" | "ans") {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::AnsibleOverview,
+            };
+        }
+
+        if first == "docker" {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::DockerOverview,
+            };
+        }
+
+        if matches!(first.as_str(), "oc" | "openshift") {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::OpenShiftProjects,
+            };
+        }
+
+        if matches!(first.as_str(), "kustomize" | "kustom") {
+            let path = parts.next().unwrap_or(".").to_string();
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::KustomizeBuild { path },
+            };
+        }
+
         if matches!(first.as_str(), "ctx" | "context") {
             let Some(context) = parts.next() else {
                 self.show_context_catalog_overlay();
@@ -2953,6 +3103,19 @@ fn is_known_command_token(token: &str) -> bool {
         token,
         "q" | "quit"
             | "exit"
+            | "ops"
+            | "argocd"
+            | "argo"
+            | "helm"
+            | "tf"
+            | "terraform"
+            | "ansible"
+            | "ans"
+            | "docker"
+            | "oc"
+            | "openshift"
+            | "kustomize"
+            | "kustom"
             | "refresh"
             | "reload"
             | "r"
@@ -3137,7 +3300,7 @@ fn normalize_status_text(status: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppCommand, DetailPaneMode, normalize_mode_prefixed_input};
+    use super::{App, AppCommand, DetailPaneMode, OpsInspectTarget, normalize_mode_prefixed_input};
     use crate::input::Action;
     use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
     use chrono::Local;
@@ -3175,6 +3338,52 @@ mod tests {
 
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::InspectTooling);
+    }
+
+    #[test]
+    fn argocd_command_requests_apps_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "argocd".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::ArgoCdApps
+            }
+        );
+    }
+
+    #[test]
+    fn helm_release_command_requests_release_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "helm my-release".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::HelmRelease {
+                    name: "my-release".to_string()
+                }
+            }
+        );
     }
 
     #[test]

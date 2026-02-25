@@ -22,9 +22,11 @@
   - pod container picker
 - Watch-based refresh for mapped resources, with periodic refresh fallback
 - Context, cluster, and user switching from kubeconfig
+- Context/user/cluster catalog overlays (`:ctx`, `:usr`, `:cluster` without args)
 - Namespace scoping (`--namespace`, `--all-namespaces`, `:ns`, `:all-ns`)
 - Pod/service port-forward management with live PF indicators
 - YAML/JSON syntax highlighting in details view
+- DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
 
 ## Supported resources
 
@@ -64,6 +66,8 @@
   - `:edit`
   - `:port-forward`
 - Optional but recommended: `metrics-server` for richer CPU/RAM dashboard data
+- Optional DevOps toolchain for overlays:
+  - `argocd`, `helm`, `terraform`, `ansible-playbook`, `docker`, `oc`, `kustomize`
 
 `orca` uses `$KUBE_EDITOR` for `:edit`; if unset, it forwards `$EDITOR` to `kubectl`.
 
@@ -158,6 +162,14 @@ Supported commands:
 - `:crd <name|kind|plural>` (`:custom`)
 - `:crd-refresh`
 - `:help`
+- `:ops`, `:tools`
+- `:argocd [app-name]`
+- `:helm [release]`
+- `:tf` (`:terraform`)
+- `:ansible` (`:ans`)
+- `:docker`
+- `:oc` (`:openshift`)
+- `:kustomize [path]`
 
 Compatibility command:
 
@@ -166,6 +178,7 @@ Compatibility command:
 ## Jump mode (`>`)
 
 - Supports the same context/cluster/user and resource aliases for fast navigation
+- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>oc`, `>kustomize`)
 - Supports namespaced targets (for example `>po my-ns/my-pod`)
 - Supports fuzzy jump by resource name/namespace when no explicit alias is provided
 - Resets to the current flow root before executing jump selection
