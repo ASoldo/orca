@@ -1605,38 +1605,21 @@ fn spans_width(spans: &[Span<'_>]) -> usize {
 }
 
 fn render_help_modal(frame: &mut Frame, app: &App) {
-    let area = centered_rect(76, 72, frame.area());
+    let area = centered_rect(78, 72, frame.area());
     frame.render_widget(Clear, area);
 
-    let mode = match app.mode() {
-        InputMode::Normal => "normal",
-        InputMode::Filter => "filter",
-        InputMode::Command => "command",
-        InputMode::Jump => "jump",
-    };
-
-    let lines = vec![
-        Line::from("orca keymap"),
+    let mut lines = vec![
+        Line::from(format!(
+            "orca help  mode:{}  scope:{}  tab:{}",
+            help_mode_label(app.mode()),
+            app.namespace_scope(),
+            app.active_tab().title()
+        )),
         Line::from(""),
-        Line::from(
-            "Navigation: j/k (up/down), gg/G (top/bottom), Ctrl+u/Ctrl+d (jump), Ctrl+0..9 (views), Ctrl+Alt+0..9 (delete view), Left/Right or resource aliases",
-        ),
-        Line::from(
-            "Modes: / (filter), : (command), > (jump), Tab (autocomplete), Esc (cancel), Enter (submit input)",
-        ),
-        Line::from(
-            "Commands: :ctx/:context :cluster/:cl :user/:usr :contexts :clusters :users :ns/:namespace :all-ns :crd :logs :shell/:ssh :edit :delete :restart :scale :exec :port-forward :refresh :q",
-        ),
-        Line::from(
-            "Resource aliases: po cj ds deploy rs rc sts job svc ing ingclass cm pvc secret sc pv sa role rb crole crb np node event ns crd",
-        ),
-        Line::from(
-            "Actions: Enter drill-down, d details, Esc back, o overview, l pod logs, Shift+L related logs, s embedded shell, e edit, p port-forward prompt, Tab pane, r refresh, ? help",
-        ),
-        Line::from("Top bar: compact icon value context; footer uses compact icon segments"),
-        Line::from(""),
-        Line::from(format!("Current mode: {mode}")),
     ];
+    for line in contextual_help_lines(app) {
+        lines.push(Line::from(line));
+    }
 
     let modal = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -1650,6 +1633,119 @@ fn render_help_modal(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::White));
 
     frame.render_widget(modal, area);
+}
+
+fn contextual_help_lines(app: &App) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    lines.push("Flow: Enter drill-down  Esc step-back  d details  o overview".to_string());
+    lines.push(
+        "Views: Ctrl+1..9 switch/create  Ctrl+Shift+1..9 mirror  Ctrl+Alt+0..9 delete".to_string(),
+    );
+    lines.push(
+        "Catalog: :ctx list/switch  :cluster list/switch  :usr list/switch  :ns list/scope"
+            .to_string(),
+    );
+    lines.push("Ops: :tools checks local DevOps CLI readiness and versions".to_string());
+    lines.push("Input: : command  > jump  / filter  Tab autocomplete  Ctrl+u/d page".to_string());
+    lines.push(String::new());
+
+    if app.shell_overlay_active() {
+        lines.push("Shell pane active".to_string());
+        lines.push("Keys: Enter run  Esc close shell  arrows/home/end move cursor".to_string());
+        lines.push("Edit: Backspace/Delete  Ctrl+a/e line bounds  Ctrl+u/k cut line".to_string());
+        lines.push("Commands: :shell [container] [auto|/bin/bash|/bin/sh]".to_string());
+        return lines;
+    }
+
+    if app.container_picker_active() {
+        lines.push("Container picker active".to_string());
+        lines.push("Keys: j/k select container  Enter or l open logs  Esc back to pod".to_string());
+        lines.push("Commands: :shell <container> [auto|/bin/bash]  :exec <cmd>".to_string());
+        return lines;
+    }
+
+    if app.table_overlay_active() {
+        lines.push("Output pane active".to_string());
+        lines.push("Keys: j/k or Ctrl+u/d scroll  gg/G top/bottom  Esc close output".to_string());
+        lines.push(
+            "Use Enter from table rows to drill deeper, then l/Shift+L for logs.".to_string(),
+        );
+        return lines;
+    }
+
+    if app.table_overview_active() {
+        lines.push("Overview pane active".to_string());
+        lines.push(
+            "Keys: o toggle overview  Esc close overview  j/k keep selection in table".to_string(),
+        );
+        lines
+            .push("Metrics follow selected row when available, fallback to aggregate.".to_string());
+        return lines;
+    }
+
+    lines.push(format!(
+        "Selected resource: {} (alias: {})",
+        app.active_tab().title(),
+        app.active_tab().short_token()
+    ));
+    lines.push(resource_tab_help(app.active_tab()));
+    lines.push(resource_commands_help(app.active_tab()));
+    lines.push("Global ops: e edit  p port-forward  r refresh  ? close help  q quit".to_string());
+    lines
+}
+
+fn resource_tab_help(tab: ResourceTab) -> String {
+    match tab {
+        ResourceTab::Pods => {
+            "Pod flow: Enter containers  l container logs  Shift+L related logs  s shell"
+                .to_string()
+        }
+        ResourceTab::Deployments
+        | ResourceTab::StatefulSets
+        | ResourceTab::DaemonSets
+        | ResourceTab::ReplicaSets
+        | ResourceTab::ReplicationControllers
+        | ResourceTab::Jobs
+        | ResourceTab::CronJobs => {
+            "Workload flow: Enter pods  Shift+L workload logs  d details  Esc to parent".to_string()
+        }
+        ResourceTab::Services => {
+            "Service flow: Enter related pods  Shift+L service logs  p port-forward".to_string()
+        }
+        ResourceTab::Namespaces => {
+            "Namespace flow: Enter namespace to switch scope and open Pods".to_string()
+        }
+        ResourceTab::CustomResources => {
+            "CRD flow: :crd <name|kind|plural> choose resource, Enter to navigate rows".to_string()
+        }
+        _ => "Resource flow: Enter if supported, d details for full object manifest.".to_string(),
+    }
+}
+
+fn resource_commands_help(tab: ResourceTab) -> String {
+    match tab {
+        ResourceTab::Pods => {
+            "Commands: :logs  :shell [container]  :exec <cmd...>  :port-forward <L:R>".to_string()
+        }
+        ResourceTab::Deployments | ResourceTab::StatefulSets => {
+            "Commands: :scale <replicas>  :restart  :edit  :delete".to_string()
+        }
+        ResourceTab::Services => "Commands: :port-forward <L:R>  :edit  :delete".to_string(),
+        ResourceTab::Namespaces => {
+            "Commands: :ns <name> set scope  :all-ns clear scope".to_string()
+        }
+        _ => "Commands: :edit  :delete (where supported)  :filter <expr>  :clear".to_string(),
+    }
+}
+
+fn help_mode_label(mode: InputMode) -> &'static str {
+    match mode {
+        InputMode::Normal => "normal",
+        InputMode::Filter => "filter",
+        InputMode::Command => "command",
+        InputMode::Jump => "jump",
+    }
 }
 
 fn table_rows_visible(area: Rect) -> usize {

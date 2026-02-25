@@ -20,8 +20,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::model::{
-    CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo, ResourceTab, RowData,
-    TableData,
+    ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
+    ResourceTab, RowData, TableData,
 };
 
 #[derive(Clone)]
@@ -50,6 +50,7 @@ struct KubeTarget {
     cluster_name: String,
     cluster_server: Option<String>,
     user_name: Option<String>,
+    namespace: Option<String>,
 }
 
 impl KubeGateway {
@@ -74,6 +75,21 @@ impl KubeGateway {
 
     pub fn available_users(&self) -> Vec<String> {
         self.available_users.clone()
+    }
+
+    pub fn context_catalog(&self) -> Vec<ContextCatalogRow> {
+        self.kube_targets
+            .iter()
+            .map(|target| ContextCatalogRow {
+                context: target.context.clone(),
+                cluster: target.cluster_name.clone(),
+                auth_info: target.user_name.clone().unwrap_or_else(|| "-".to_string()),
+                namespace: target
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| self.default_namespace.clone()),
+            })
+            .collect()
     }
 
     pub async fn switch_context(&mut self, context: &str) -> Result<()> {
@@ -2412,6 +2428,7 @@ fn build_kube_targets(kubeconfig: &Kubeconfig) -> Vec<KubeTarget> {
                     .cloned()
                     .unwrap_or(None),
                 user_name: context.user.clone(),
+                namespace: context.namespace.clone(),
             })
         })
         .collect::<Vec<_>>();

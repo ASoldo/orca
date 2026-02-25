@@ -1,10 +1,10 @@
 use crate::input::Action;
 use crate::model::{
-    CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo, ResourceTab, RowData,
-    TableData,
+    ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
+    ResourceTab, RowData, TableData,
 };
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InputMode {
@@ -104,6 +104,7 @@ pub enum AppCommand {
     SwitchUser {
         user: String,
     },
+    InspectTooling,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +210,7 @@ pub struct App {
     detail_view_height: u16,
     discovered_crds: Vec<CustomResourceDef>,
     selected_crd: Option<String>,
+    context_catalog: Vec<ContextCatalogRow>,
     available_contexts: Vec<String>,
     available_clusters: Vec<String>,
     available_users: Vec<String>,
@@ -291,6 +293,7 @@ impl App {
             detail_view_height: 20,
             discovered_crds: Vec::new(),
             selected_crd: None,
+            context_catalog: Vec::new(),
             available_contexts: Vec::new(),
             available_clusters: Vec::new(),
             available_users: Vec::new(),
@@ -356,6 +359,7 @@ impl App {
         contexts: Vec<String>,
         clusters: Vec<String>,
         users: Vec<String>,
+        mut context_catalog: Vec<ContextCatalogRow>,
     ) {
         self.available_contexts = contexts;
         self.available_contexts.sort();
@@ -368,6 +372,9 @@ impl App {
         self.available_users = users;
         self.available_users.sort();
         self.available_users.dedup();
+
+        context_catalog.sort_by(|left, right| left.context.cmp(&right.context));
+        self.context_catalog = context_catalog;
     }
 
     pub fn set_user(&mut self, user: String) {
@@ -815,6 +822,11 @@ impl App {
     pub fn set_shell_overlay(&mut self, title: impl Into<String>, detail: String) {
         self.set_table_overlay_with_kind(title, detail, TableOverlayKind::Shell);
         self.table_scroll = self.table_max_scroll();
+    }
+
+    pub fn set_output_overlay(&mut self, title: impl Into<String>, detail: String) {
+        self.set_table_overlay_with_kind(title, detail, TableOverlayKind::Generic);
+        self.table_scroll = 0;
     }
 
     pub fn replace_shell_output(&mut self, snapshot: String) {
@@ -1607,6 +1619,7 @@ impl App {
     fn command_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "help".to_string(),
+            "tools".to_string(),
             "refresh".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
@@ -1996,10 +2009,11 @@ impl App {
                 self.status = "Exit requested".to_string();
                 AppCommand::None
             }
+            "tools" => AppCommand::InspectTooling,
             "refresh" | "reload" | "r" => AppCommand::RefreshActive,
             "ctx" | "context" | "use-context" => {
                 let Some(context) = parts.next() else {
-                    self.status = "Usage: :ctx <context-name>".to_string();
+                    self.show_context_catalog_overlay();
                     return AppCommand::None;
                 };
                 self.status = format!("Switching context to '{context}'");
@@ -2009,7 +2023,7 @@ impl App {
             }
             "cluster" | "cl" => {
                 let Some(cluster) = parts.next() else {
-                    self.status = "Usage: :cluster <cluster-name>".to_string();
+                    self.show_cluster_catalog_overlay();
                     return AppCommand::None;
                 };
                 self.status = format!("Switching cluster to '{cluster}'");
@@ -2019,7 +2033,7 @@ impl App {
             }
             "user" | "usr" => {
                 let Some(user) = parts.next() else {
-                    self.status = "Usage: :user <kubeconfig-user>".to_string();
+                    self.show_user_catalog_overlay();
                     return AppCommand::None;
                 };
                 self.status = format!("Switching to user '{user}'");
@@ -2028,24 +2042,15 @@ impl App {
                 }
             }
             "contexts" => {
-                self.status = format!(
-                    "Contexts: {}",
-                    format_catalog_preview(&self.available_contexts, 10)
-                );
+                self.show_context_catalog_overlay();
                 AppCommand::None
             }
             "clusters" => {
-                self.status = format!(
-                    "Clusters: {}",
-                    format_catalog_preview(&self.available_clusters, 10)
-                );
+                self.show_cluster_catalog_overlay();
                 AppCommand::None
             }
             "users" => {
-                self.status = format!(
-                    "Users: {}",
-                    format_catalog_preview(&self.available_users, 10)
-                );
+                self.show_user_catalog_overlay();
                 AppCommand::None
             }
             "all-ns" | "allns" | "all" | "all-namespaces" => {
@@ -2163,7 +2168,7 @@ impl App {
         let first = resolve_command_token(parts.next().unwrap_or_default());
         if matches!(first.as_str(), "ctx" | "context") {
             let Some(context) = parts.next() else {
-                self.status = "Usage: > ctx <context-name>".to_string();
+                self.show_context_catalog_overlay();
                 return AppCommand::None;
             };
             self.status = format!("Switching context to '{context}'");
@@ -2174,7 +2179,7 @@ impl App {
 
         if matches!(first.as_str(), "cluster" | "cl") {
             let Some(cluster) = parts.next() else {
-                self.status = "Usage: > cluster <cluster-name>".to_string();
+                self.show_cluster_catalog_overlay();
                 return AppCommand::None;
             };
             self.status = format!("Switching cluster to '{cluster}'");
@@ -2185,7 +2190,7 @@ impl App {
 
         if matches!(first.as_str(), "user" | "usr") {
             let Some(user) = parts.next() else {
-                self.status = "Usage: > user <kubeconfig-user>".to_string();
+                self.show_user_catalog_overlay();
                 return AppCommand::None;
             };
             self.status = format!("Switching to user '{user}'");
@@ -2195,26 +2200,17 @@ impl App {
         }
 
         if first == "contexts" {
-            self.status = format!(
-                "Contexts: {}",
-                format_catalog_preview(&self.available_contexts, 10)
-            );
+            self.show_context_catalog_overlay();
             return AppCommand::None;
         }
 
         if first == "clusters" {
-            self.status = format!(
-                "Clusters: {}",
-                format_catalog_preview(&self.available_clusters, 10)
-            );
+            self.show_cluster_catalog_overlay();
             return AppCommand::None;
         }
 
         if first == "users" {
-            self.status = format!(
-                "Users: {}",
-                format_catalog_preview(&self.available_users, 10)
-            );
+            self.show_user_catalog_overlay();
             return AppCommand::None;
         }
 
@@ -2254,6 +2250,147 @@ impl App {
 
         self.status = format!("No resource matched jump query '{jump}'");
         AppCommand::None
+    }
+
+    fn show_context_catalog_overlay(&mut self) {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{:<2} {:<28} {:<24} {:<22} {}",
+            "", "NAME", "CLUSTER", "AUTHINFO", "NAMESPACE"
+        ));
+
+        if self.context_catalog.is_empty() {
+            lines.push("No contexts found in kubeconfig".to_string());
+        } else {
+            for row in &self.context_catalog {
+                let active = if row.context == self.context {
+                    "*"
+                } else {
+                    " "
+                };
+                lines.push(format!(
+                    "{:<2} {:<28} {:<24} {:<22} {}",
+                    active,
+                    table_cell(&row.context, 28),
+                    table_cell(&row.cluster, 24),
+                    table_cell(&row.auth_info, 22),
+                    row.namespace
+                ));
+            }
+        }
+
+        self.set_output_overlay(
+            format!("contexts(all)[{}]", self.context_catalog.len()),
+            lines.join("\n"),
+        );
+        self.status = "Context catalog opened (:ctx <name> to switch)".to_string();
+    }
+
+    fn show_cluster_catalog_overlay(&mut self) {
+        let mut cluster_map = HashMap::<String, (HashSet<String>, HashSet<String>)>::new();
+        for row in &self.context_catalog {
+            let entry = cluster_map
+                .entry(row.cluster.clone())
+                .or_insert_with(|| (HashSet::new(), HashSet::new()));
+            entry.0.insert(row.context.clone());
+            entry.1.insert(row.auth_info.clone());
+        }
+
+        let mut clusters = self.available_clusters.clone();
+        for cluster in cluster_map.keys() {
+            if !clusters.contains(cluster) {
+                clusters.push(cluster.clone());
+            }
+        }
+        clusters.sort();
+        clusters.dedup();
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{:<2} {:<32} {:<9} {}",
+            "", "CLUSTER", "CONTEXTS", "USERS"
+        ));
+
+        if clusters.is_empty() {
+            lines.push("No clusters found in kubeconfig".to_string());
+        } else {
+            for cluster in &clusters {
+                let (contexts, users) = cluster_map
+                    .get(cluster)
+                    .map(|(contexts, users)| (contexts.len(), users.len()))
+                    .unwrap_or((0, 0));
+                let active = if self
+                    .context_catalog
+                    .iter()
+                    .any(|row| row.context == self.context && row.cluster == *cluster)
+                {
+                    "*"
+                } else {
+                    " "
+                };
+                lines.push(format!(
+                    "{:<2} {:<32} {:<9} {}",
+                    active,
+                    table_cell(cluster, 32),
+                    contexts,
+                    users
+                ));
+            }
+        }
+
+        self.set_output_overlay(
+            format!("clusters(all)[{}]", clusters.len()),
+            lines.join("\n"),
+        );
+        self.status = "Cluster catalog opened (:cluster <name> to switch)".to_string();
+    }
+
+    fn show_user_catalog_overlay(&mut self) {
+        let mut user_map = HashMap::<String, (HashSet<String>, HashSet<String>)>::new();
+        for row in &self.context_catalog {
+            let entry = user_map
+                .entry(row.auth_info.clone())
+                .or_insert_with(|| (HashSet::new(), HashSet::new()));
+            entry.0.insert(row.context.clone());
+            entry.1.insert(row.cluster.clone());
+        }
+
+        let mut users = self.available_users.clone();
+        for user in user_map.keys() {
+            if !users.contains(user) {
+                users.push(user.clone());
+            }
+        }
+        users.sort();
+        users.dedup();
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "{:<2} {:<34} {:<9} {}",
+            "", "AUTHINFO", "CONTEXTS", "CLUSTERS"
+        ));
+
+        if users.is_empty() {
+            lines.push("No users found in kubeconfig".to_string());
+        } else {
+            for user in &users {
+                let (contexts, clusters) = user_map
+                    .get(user)
+                    .map(|(contexts, clusters)| (contexts.len(), clusters.len()))
+                    .unwrap_or((0, 0));
+                let active = if *user == self.user { "*" } else { " " };
+                lines.push(format!(
+                    "{:<2} {:<34} {:<9} {}",
+                    active,
+                    table_cell(user, 34),
+                    contexts,
+                    clusters
+                ));
+            }
+        }
+
+        self.set_output_overlay(format!("users(all)[{}]", users.len()), lines.join("\n"));
+        self.status = "User catalog opened (:usr <name> to switch)".to_string();
     }
 
     fn handle_tab_shortcut(&mut self, tab: ResourceTab, remainder: &str) -> AppCommand {
@@ -2819,6 +2956,7 @@ fn is_known_command_token(token: &str) -> bool {
             | "refresh"
             | "reload"
             | "r"
+            | "tools"
             | "ctx"
             | "context"
             | "use-context"
@@ -2942,22 +3080,22 @@ fn normalize_mode_prefixed_input(input: &str) -> String {
     query.to_string()
 }
 
-fn format_catalog_preview(values: &[String], limit: usize) -> String {
-    if values.is_empty() {
-        return "-".to_string();
+fn table_cell(value: &str, width: usize) -> String {
+    let count = value.chars().count();
+    if count <= width {
+        return value.to_string();
     }
 
-    let shown = values
-        .iter()
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    if values.len() > limit {
-        format!("{shown}, +{}", values.len().saturating_sub(limit))
-    } else {
-        shown
+    if width <= 1 {
+        return "…".to_string();
     }
+
+    let mut out = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 fn completion_matches(candidate: &str, query: &str) -> bool {
@@ -3001,7 +3139,7 @@ fn normalize_status_text(status: String) -> String {
 mod tests {
     use super::{App, AppCommand, DetailPaneMode, normalize_mode_prefixed_input};
     use crate::input::Action;
-    use crate::model::{NamespaceScope, ResourceTab, RowData, TableData};
+    use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
     use chrono::Local;
 
     #[test]
@@ -3020,6 +3158,23 @@ mod tests {
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::None);
         assert_eq!(app.filter(), "api");
+    }
+
+    #[test]
+    fn tools_command_requests_tooling_inspection() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "tools".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::InspectTooling);
     }
 
     #[test]
@@ -3265,6 +3420,37 @@ mod tests {
     }
 
     #[test]
+    fn ctx_without_arg_opens_context_catalog_overlay() {
+        let mut app = App::new(
+            "https://cluster".to_string(),
+            "openclaw".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_kube_catalog(
+            vec!["openclaw".to_string()],
+            vec!["openclaw".to_string()],
+            vec!["openclaw".to_string()],
+            vec![ContextCatalogRow {
+                context: "openclaw".to_string(),
+                cluster: "openclaw".to_string(),
+                auth_info: "openclaw".to_string(),
+                namespace: "openclaw".to_string(),
+            }],
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "ctx".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.table_overlay_active());
+        assert_eq!(app.pane_label(), "out");
+        assert!(app.table_overlay_text().unwrap_or("").contains("openclaw"));
+    }
+
+    #[test]
     fn jump_cluster_returns_switch_cluster_command() {
         let mut app = App::new(
             "cluster".to_string(),
@@ -3328,6 +3514,47 @@ mod tests {
                 user: "platform-admin".to_string()
             }
         );
+    }
+
+    #[test]
+    fn usr_without_arg_opens_user_catalog_overlay() {
+        let mut app = App::new(
+            "https://cluster".to_string(),
+            "openclaw".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_user("openclaw".to_string());
+        app.set_kube_catalog(
+            vec!["openclaw".to_string()],
+            vec!["openclaw".to_string()],
+            vec!["openclaw".to_string(), "robot".to_string()],
+            vec![
+                ContextCatalogRow {
+                    context: "openclaw".to_string(),
+                    cluster: "openclaw".to_string(),
+                    auth_info: "openclaw".to_string(),
+                    namespace: "openclaw".to_string(),
+                },
+                ContextCatalogRow {
+                    context: "build".to_string(),
+                    cluster: "openclaw".to_string(),
+                    auth_info: "robot".to_string(),
+                    namespace: "ci".to_string(),
+                },
+            ],
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "usr".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.table_overlay_active());
+        let text = app.table_overlay_text().unwrap_or("");
+        assert!(text.contains("openclaw"));
+        assert!(text.contains("robot"));
     }
 
     #[test]

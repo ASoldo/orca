@@ -202,6 +202,14 @@ pub struct CustomResourceDef {
     pub namespaced: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ContextCatalogRow {
+    pub context: String,
+    pub cluster: String,
+    pub auth_info: String,
+    pub namespace: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub struct PodContainerInfo {
     pub name: String,

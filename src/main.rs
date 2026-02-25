@@ -98,6 +98,7 @@ async fn main() -> Result<()> {
         gateway.available_contexts(),
         gateway.available_clusters(),
         gateway.available_users(),
+        gateway.context_catalog(),
     );
 
     if args.all_namespaces && args.namespace.is_some() {
@@ -669,6 +670,11 @@ async fn execute_app_command(
                 )),
             }
         }
+        AppCommand::InspectTooling => {
+            let report = inspect_toolchain().await;
+            app.set_output_overlay("Toolchain Inventory", report);
+            app.set_status("Toolchain inventory refreshed");
+        }
         AppCommand::SwitchContext { context } => match gateway.switch_context(&context).await {
             Ok(()) => {
                 app.set_kube_target(
@@ -682,6 +688,7 @@ async fn execute_app_command(
                     gateway.available_contexts(),
                     gateway.available_clusters(),
                     gateway.available_users(),
+                    gateway.context_catalog(),
                 );
                 refresh_custom_resource_catalog(app, gateway).await;
                 let tabs = app.tabs().to_vec();
@@ -712,6 +719,7 @@ async fn execute_app_command(
                     gateway.available_contexts(),
                     gateway.available_clusters(),
                     gateway.available_users(),
+                    gateway.context_catalog(),
                 );
                 refresh_custom_resource_catalog(app, gateway).await;
                 let tabs = app.tabs().to_vec();
@@ -743,6 +751,7 @@ async fn execute_app_command(
                     gateway.available_contexts(),
                     gateway.available_clusters(),
                     gateway.available_users(),
+                    gateway.context_catalog(),
                 );
                 refresh_custom_resource_catalog(app, gateway).await;
                 let tabs = app.tabs().to_vec();
@@ -762,6 +771,130 @@ async fn execute_app_command(
     }
 
     LoopEffect::None
+}
+
+struct ToolProbe {
+    name: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+async fn inspect_toolchain() -> String {
+    let probes = [
+        ToolProbe {
+            name: "kubectl",
+            program: "kubectl",
+            args: &["version", "--client=true"],
+        },
+        ToolProbe {
+            name: "oc",
+            program: "oc",
+            args: &["version", "--client=true"],
+        },
+        ToolProbe {
+            name: "helm",
+            program: "helm",
+            args: &["version", "--short"],
+        },
+        ToolProbe {
+            name: "argocd",
+            program: "argocd",
+            args: &["version", "--client", "--short"],
+        },
+        ToolProbe {
+            name: "terraform",
+            program: "terraform",
+            args: &["version"],
+        },
+        ToolProbe {
+            name: "ansible-playbook",
+            program: "ansible-playbook",
+            args: &["--version"],
+        },
+        ToolProbe {
+            name: "docker",
+            program: "docker",
+            args: &["--version"],
+        },
+        ToolProbe {
+            name: "kustomize",
+            program: "kustomize",
+            args: &["version"],
+        },
+    ];
+
+    let mut lines = vec![format!("{:<18} {:<10} {}", "TOOL", "STATUS", "DETAIL")];
+    for probe in probes {
+        match probe_tool_version(&probe).await {
+            Ok(detail) => lines.push(format!(
+                "{:<18} {:<10} {}",
+                probe.name,
+                "ok",
+                fit_text(&detail, 120)
+            )),
+            Err(error) => lines.push(format!(
+                "{:<18} {:<10} {}",
+                probe.name,
+                "missing",
+                fit_text(&error, 120)
+            )),
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Use :ctx / :cluster / :usr for kube target catalogs.".to_string());
+    lines.push(
+        "Use :shell (pods), :logs, :scale, :restart, :port-forward from resource tables."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+async fn probe_tool_version(probe: &ToolProbe) -> std::result::Result<String, String> {
+    let mut cmd = TokioCommand::new(probe.program);
+    cmd.args(probe.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(3), cmd.output())
+        .await
+        .map_err(|_| "timeout".to_string())?
+        .map_err(|error| error.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = first_non_empty_line(if stdout.is_empty() { &stderr } else { &stdout });
+
+    if output.status.success() {
+        Ok(detail.unwrap_or_else(|| "available".to_string()))
+    } else if let Some(detail) = detail {
+        Err(detail)
+    } else {
+        Err(format!("exit {}", output.status))
+    }
+}
+
+fn first_non_empty_line(input: &str) -> Option<String> {
+    input
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+}
+
+fn fit_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let mut out = input
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
