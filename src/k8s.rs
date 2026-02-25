@@ -257,6 +257,19 @@ impl KubeGateway {
     ) -> Result<TableData> {
         let refreshed_at = Local::now();
         let (headers, mut rows) = match tab {
+            ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys => {
+                anyhow::bail!(
+                    "{} is fetched from Argo CD API, not Kubernetes API",
+                    tab.title()
+                )
+            }
             ResourceTab::Pods => self.fetch_pods(scope).await?,
             ResourceTab::CronJobs => self.fetch_cronjobs(scope).await?,
             ResourceTab::DaemonSets => self.fetch_daemonsets(scope).await?,
@@ -703,7 +716,16 @@ impl KubeGateway {
                 let api: Api<Namespace> = Api::all(self.client.clone());
                 let _ = api.delete(name, &params).await?;
             }
-            ResourceTab::Events | ResourceTab::CustomResources => {
+            ResourceTab::Events
+            | ResourceTab::CustomResources
+            | ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys => {
                 anyhow::bail!("delete is not supported for {}", tab.title());
             }
         }

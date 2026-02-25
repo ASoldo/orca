@@ -4,6 +4,14 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ResourceTab {
+    ArgoCdApps,
+    ArgoCdResources,
+    ArgoCdProjects,
+    ArgoCdRepos,
+    ArgoCdClusters,
+    ArgoCdAccounts,
+    ArgoCdCerts,
+    ArgoCdGpgKeys,
     Pods,
     CronJobs,
     DaemonSets,
@@ -33,7 +41,15 @@ pub enum ResourceTab {
 }
 
 impl ResourceTab {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 34] = [
+        Self::ArgoCdApps,
+        Self::ArgoCdResources,
+        Self::ArgoCdProjects,
+        Self::ArgoCdRepos,
+        Self::ArgoCdClusters,
+        Self::ArgoCdAccounts,
+        Self::ArgoCdCerts,
+        Self::ArgoCdGpgKeys,
         Self::Pods,
         Self::CronJobs,
         Self::DaemonSets,
@@ -64,6 +80,14 @@ impl ResourceTab {
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::ArgoCdApps => "ArgoApps",
+            Self::ArgoCdResources => "ArgoResources",
+            Self::ArgoCdProjects => "ArgoProjects",
+            Self::ArgoCdRepos => "ArgoRepos",
+            Self::ArgoCdClusters => "ArgoClusters",
+            Self::ArgoCdAccounts => "ArgoAccounts",
+            Self::ArgoCdCerts => "ArgoCerts",
+            Self::ArgoCdGpgKeys => "ArgoGpg",
             Self::Pods => "Pods",
             Self::CronJobs => "CronJobs",
             Self::DaemonSets => "DaemonSets",
@@ -95,6 +119,20 @@ impl ResourceTab {
 
     pub fn from_token(token: &str) -> Option<Self> {
         match token.to_ascii_lowercase().as_str() {
+            "argo" | "argocd" | "argoapps" | "argocdapps" | "argocd-apps" => Some(Self::ArgoCdApps),
+            "argores" | "argocdres" | "argoresources" | "argocdresources" | "argocd-resources" => {
+                Some(Self::ArgoCdResources)
+            }
+            "argoproj" | "argocdproj" | "argocdprojects" | "argoprojects" => {
+                Some(Self::ArgoCdProjects)
+            }
+            "argorepo" | "argocdrepo" | "argocdrepos" | "argorepos" | "repositories" => {
+                Some(Self::ArgoCdRepos)
+            }
+            "argocls" | "argocdclusters" | "argoclusters" => Some(Self::ArgoCdClusters),
+            "argoacct" | "argocdaccounts" | "argoaccounts" => Some(Self::ArgoCdAccounts),
+            "argocert" | "argocdcerts" | "argocerts" => Some(Self::ArgoCdCerts),
+            "argogpg" | "argocdgpg" | "argogpgkeys" | "argocdgpgkeys" => Some(Self::ArgoCdGpgKeys),
             "po" | "pod" | "pods" => Some(Self::Pods),
             "cj" | "cronjob" | "cronjobs" | "cron-job" | "cron-jobs" => Some(Self::CronJobs),
             "ds" | "daemonset" | "daemonsets" | "daemon-set" | "daemon-sets" => {
@@ -162,6 +200,14 @@ impl ResourceTab {
 
     pub fn short_token(self) -> &'static str {
         match self {
+            Self::ArgoCdApps => "argo",
+            Self::ArgoCdResources => "argores",
+            Self::ArgoCdProjects => "argoproj",
+            Self::ArgoCdRepos => "argorepo",
+            Self::ArgoCdClusters => "argocls",
+            Self::ArgoCdAccounts => "argoacct",
+            Self::ArgoCdCerts => "argocert",
+            Self::ArgoCdGpgKeys => "argogpg",
             Self::Pods => "po",
             Self::CronJobs => "cj",
             Self::DaemonSets => "ds",

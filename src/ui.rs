@@ -130,7 +130,17 @@ fn build_left_header_line(app: &App) -> Line<'static> {
     };
 
     let mut spans = Vec::new();
-    let cluster_value = compact_text(&display_cluster_endpoint(app.cluster()), 26);
+    let argo_mode = matches!(
+        app.active_tab(),
+        ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys
+    );
     push_powerline_segment(&mut spans, " ORCA ", Color::Black, ACCENT, PL_A);
     push_powerline_segment(
         &mut spans,
@@ -139,44 +149,83 @@ fn build_left_header_line(app: &App) -> Line<'static> {
         PL_A,
         PL_B,
     );
-    push_powerline_segment(
-        &mut spans,
-        format!(" 󰠳 {} ", cluster_value),
-        Color::White,
-        PL_B,
-        PL_C,
-    );
-    push_powerline_segment(
-        &mut spans,
-        format!(" 󱃾 {} ", compact_text(app.context(), 14)),
-        Color::White,
-        PL_C,
-        PL_D,
-    );
-    push_powerline_segment(
-        &mut spans,
-        format!(" 󰉖 {} ", compact_text(&app.namespace_scope().label(), 12)),
-        Color::White,
-        PL_D,
-        Color::Rgb(88, 28, 135),
-    );
-    push_powerline_segment(
-        &mut spans,
-        format!(
-            " 󰈲 {} ",
-            compact_text(
-                if app.filter().is_empty() {
-                    "-"
-                } else {
-                    app.filter()
-                },
-                14,
-            )
-        ),
-        Color::White,
-        Color::Rgb(88, 28, 135),
-        Color::Rgb(88, 28, 135),
-    );
+    if argo_mode {
+        let server_value = compact_text(app.argocd_server(), 24);
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󰡨 {} ", server_value),
+            Color::White,
+            PL_B,
+            PL_C,
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(
+                " 󰙲 {} ",
+                compact_text(app.argocd_selected_app().unwrap_or("-"), 16)
+            ),
+            Color::White,
+            PL_C,
+            PL_D,
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(
+                " 󰈲 {} ",
+                compact_text(
+                    if app.filter().is_empty() {
+                        "-"
+                    } else {
+                        app.filter()
+                    },
+                    14,
+                )
+            ),
+            Color::White,
+            PL_D,
+            Color::Rgb(88, 28, 135),
+        );
+    } else {
+        let cluster_value = compact_text(&display_cluster_endpoint(app.cluster()), 26);
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󰠳 {} ", cluster_value),
+            Color::White,
+            PL_B,
+            PL_C,
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󱃾 {} ", compact_text(app.context(), 14)),
+            Color::White,
+            PL_C,
+            PL_D,
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󰉖 {} ", compact_text(&app.namespace_scope().label(), 12)),
+            Color::White,
+            PL_D,
+            Color::Rgb(88, 28, 135),
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(
+                " 󰈲 {} ",
+                compact_text(
+                    if app.filter().is_empty() {
+                        "-"
+                    } else {
+                        app.filter()
+                    },
+                    14,
+                )
+            ),
+            Color::White,
+            Color::Rgb(88, 28, 135),
+            Color::Rgb(88, 28, 135),
+        );
+    }
     if let Some(port_forward) = app.port_forward_badge() {
         push_powerline_segment(
             &mut spans,
@@ -762,6 +811,101 @@ fn format_cpu_millicores(value: u64) -> String {
 
 fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
     match tab {
+        ResourceTab::ArgoCdApps => {
+            let sync = row
+                .columns
+                .get(3)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let health = row
+                .columns
+                .get(4)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if health.contains("healthy") && sync.contains("synced") {
+                100
+            } else if health.contains("progress") || sync.contains("outofsync") {
+                60
+            } else {
+                35
+            }
+        }
+        ResourceTab::ArgoCdResources => {
+            let sync = row
+                .columns
+                .get(3)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let health = row
+                .columns
+                .get(4)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if health.contains("healthy") && sync.contains("synced") {
+                100
+            } else if health.contains("degraded")
+                || health.contains("missing")
+                || sync.contains("outofsync")
+            {
+                35
+            } else {
+                60
+            }
+        }
+        ResourceTab::ArgoCdProjects => {
+            let destinations = row
+                .columns
+                .get(2)
+                .and_then(|value| parse_u64(value))
+                .unwrap_or(0);
+            let repos = row
+                .columns
+                .get(3)
+                .and_then(|value| parse_u64(value))
+                .unwrap_or(0);
+            if destinations > 0 && repos > 0 {
+                95
+            } else if destinations > 0 || repos > 0 {
+                70
+            } else {
+                45
+            }
+        }
+        ResourceTab::ArgoCdRepos => {
+            let insecure = row
+                .columns
+                .get(4)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            if insecure == "yes" { 65 } else { 90 }
+        }
+        ResourceTab::ArgoCdClusters => row
+            .columns
+            .get(2)
+            .map(|value| value.to_ascii_lowercase())
+            .map(|status| {
+                if status.contains("successful") || status.contains("healthy") {
+                    100
+                } else if status.contains("unknown") {
+                    50
+                } else {
+                    35
+                }
+            })
+            .unwrap_or(50),
+        ResourceTab::ArgoCdAccounts => row
+            .columns
+            .get(1)
+            .map(|value| value.to_ascii_lowercase())
+            .map(|enabled| {
+                if enabled == "yes" || enabled == "true" {
+                    90
+                } else {
+                    40
+                }
+            })
+            .unwrap_or(50),
+        ResourceTab::ArgoCdCerts | ResourceTab::ArgoCdGpgKeys => 85,
         ResourceTab::Pods => {
             let ready = row
                 .columns
@@ -955,6 +1099,53 @@ fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
 
 fn selected_metric_line(tab: ResourceTab, row: &RowData) -> String {
     match tab {
+        ResourceTab::ArgoCdApps => format!(
+            "project:{} ns:{} sync:{} health:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            row.columns.get(2).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str),
+            row.columns.get(4).map_or("-", String::as_str)
+        ),
+        ResourceTab::ArgoCdResources => format!(
+            "kind:{} sync:{} health:{}",
+            row.columns.get(0).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str),
+            row.columns.get(4).map_or("-", String::as_str)
+        ),
+        ResourceTab::ArgoCdProjects => format!(
+            "ns:{} dest:{} repos:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            row.columns.get(2).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str)
+        ),
+        ResourceTab::ArgoCdRepos => format!(
+            "type:{} project:{} oci:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str),
+            row.columns.get(5).map_or("-", String::as_str)
+        ),
+        ResourceTab::ArgoCdClusters => format!(
+            "status:{} version:{} apps:{}",
+            row.columns.get(2).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str),
+            row.columns.get(4).map_or("-", String::as_str)
+        ),
+        ResourceTab::ArgoCdAccounts => format!(
+            "enabled:{} caps:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            compact_text(row.columns.get(2).map_or("-", String::as_str), 18)
+        ),
+        ResourceTab::ArgoCdCerts => format!(
+            "type:{} sub:{} fp:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            row.columns.get(2).map_or("-", String::as_str),
+            compact_text(row.columns.get(3).map_or("-", String::as_str), 14)
+        ),
+        ResourceTab::ArgoCdGpgKeys => format!(
+            "fingerprint:{} uids:{}",
+            compact_text(row.columns.get(1).map_or("-", String::as_str), 16),
+            compact_text(row.columns.get(2).map_or("-", String::as_str), 16)
+        ),
         ResourceTab::Pods => format!(
             "ready:{} status:{} restarts:{}",
             row.columns.get(2).map_or("-", String::as_str),
@@ -1110,18 +1301,9 @@ fn parse_u64(value: &str) -> Option<u64> {
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     if matches!(app.mode(), InputMode::Normal) {
-        let refresh_line = app
-            .active_last_refresh()
-            .map(|ts| {
-                ts.split_whitespace()
-                    .last()
-                    .unwrap_or(ts.as_str())
-                    .to_string()
-            })
-            .unwrap_or_else(|| "n/a".to_string());
         let status_text = app
             .pending_confirmation_prompt()
-            .map(|pending| format!("{pending} [y/n]"))
+            .map(|pending| format!("{pending}? (y/n)"))
             .unwrap_or_else(|| app.status().to_string());
 
         let mut spans = Vec::new();
@@ -1148,28 +1330,26 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             " 󰘳 nrm "
         };
         push_powerline_segment(&mut spans, mode_label, mode_fg, mode_bg, status_bg);
+        let status_width_hint = if app.pending_confirmation_prompt().is_some() {
+            area.width.saturating_sub(10) as usize
+        } else {
+            area.width.saturating_sub(24).min(120) as usize
+        };
         push_powerline_segment(
             &mut spans,
-            format!(" {status_icon} {} ", compact_text(&status_text, 40)),
+            format!(
+                " {status_icon} {} ",
+                compact_text(&status_text, status_width_hint.max(24))
+            ),
             status_fg,
             status_bg,
-            PL_C,
-        );
-        push_powerline_segment(
-            &mut spans,
-            format!(" 󰚰 {} ", compact_text(&refresh_line, 10)),
-            Color::White,
-            PL_C,
-            PL_D,
-        );
-        push_powerline_segment(
-            &mut spans,
-            format!(" 󱂬 {} ", app.pane_label()),
-            Color::White,
-            PL_D,
             BG,
         );
-        let right_spans = build_footer_glance_spans(app);
+        let right_spans = if app.pending_confirmation_prompt().is_some() {
+            Vec::new()
+        } else {
+            build_footer_glance_spans(app)
+        };
         if right_spans.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
@@ -1274,6 +1454,144 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn build_footer_glance_spans(app: &App) -> Vec<Span<'static>> {
+    if matches!(
+        app.active_tab(),
+        ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys
+    ) {
+        let visible_count = app.active_visible_rows().len();
+        let selected = app.active_selected_row();
+        let (field_one, field_two, field_three) = match app.active_tab() {
+            ResourceTab::ArgoCdApps => (
+                selected
+                    .and_then(|row| row.columns.get(3))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(4))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                app.argocd_selected_app()
+                    .map(|value| compact_text(value, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdResources => (
+                selected
+                    .and_then(|row| row.columns.get(3))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(4))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdProjects => (
+                selected
+                    .and_then(|row| row.columns.get(2))
+                    .map(|value| format!("dst:{value}"))
+                    .unwrap_or_else(|| "dst:-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(3))
+                    .map(|value| format!("repo:{value}"))
+                    .unwrap_or_else(|| "repo:-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdRepos => (
+                selected
+                    .and_then(|row| row.columns.get(1))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(4))
+                    .map(|value| format!("tls:{value}"))
+                    .unwrap_or_else(|| "tls:-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdClusters => (
+                selected
+                    .and_then(|row| row.columns.get(2))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(4))
+                    .map(|value| format!("apps:{value}"))
+                    .unwrap_or_else(|| "apps:-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdAccounts => (
+                selected
+                    .and_then(|row| row.columns.get(1))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(2))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            ResourceTab::ArgoCdCerts | ResourceTab::ArgoCdGpgKeys => (
+                selected
+                    .and_then(|row| row.columns.get(1))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .and_then(|row| row.columns.get(2))
+                    .map(|value| compact_text(value, 12))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected
+                    .map(|row| compact_text(&row.name, 16))
+                    .unwrap_or_else(|| "-".to_string()),
+            ),
+            _ => ("-".to_string(), "-".to_string(), "-".to_string()),
+        };
+        let mut spans = Vec::new();
+        let mut next_bg = BG;
+        let segments = vec![
+            (
+                format!(" 󰀶 {} ", visible_count),
+                Color::Black,
+                Color::Rgb(45, 212, 191),
+            ),
+            (
+                format!(" 󱎘 {} ", field_one),
+                Color::Black,
+                Color::Rgb(99, 102, 241),
+            ),
+            (
+                format!(" 󰖌 {} ", field_two),
+                Color::Black,
+                Color::Rgb(74, 222, 128),
+            ),
+            (
+                format!(" 󰙲 {} ", field_three),
+                Color::White,
+                Color::Rgb(124, 58, 237),
+            ),
+        ];
+        for (content, fg, bg) in segments {
+            push_powerline_segment_rtl(&mut spans, content, fg, bg, next_bg);
+            next_bg = bg;
+        }
+        return spans;
+    }
+
     let metrics = app.overview_metrics();
     let alerts = app.alert_snapshot();
     let selected_usage = app
@@ -1724,6 +2042,29 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
 
 fn resource_tab_help(tab: ResourceTab) -> String {
     match tab {
+        ResourceTab::ArgoCdApps => {
+            "Argo CD flow: Enter opens selected app resources  d shows app details".to_string()
+        }
+        ResourceTab::ArgoCdResources => {
+            "Argo CD resources: Enter opens summary/events/logs panel  d shows raw details"
+                .to_string()
+        }
+        ResourceTab::ArgoCdProjects => {
+            "Argo CD projects: Enter/d opens project spec details".to_string()
+        }
+        ResourceTab::ArgoCdRepos => {
+            "Argo CD repositories: Enter/d opens repository config details".to_string()
+        }
+        ResourceTab::ArgoCdClusters => {
+            "Argo CD clusters: Enter/d opens cluster connection details".to_string()
+        }
+        ResourceTab::ArgoCdAccounts => {
+            "Argo CD accounts: Enter/d opens account capabilities".to_string()
+        }
+        ResourceTab::ArgoCdCerts => {
+            "Argo CD certs: Enter/d opens known hosts / cert records".to_string()
+        }
+        ResourceTab::ArgoCdGpgKeys => "Argo CD GPG: Enter/d opens signing key metadata".to_string(),
         ResourceTab::Pods => {
             "Pod flow: Enter containers  l container logs  Shift+L related logs  s shell"
                 .to_string()
@@ -1752,6 +2093,16 @@ fn resource_tab_help(tab: ResourceTab) -> String {
 
 fn resource_commands_help(tab: ResourceTab) -> String {
     match tab {
+        ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources => "Commands: :argocd [app]  :argocd resources  Enter panel  :argocd sync|refresh|diff|history|rollback|delete [app]"
+            .to_string(),
+        ResourceTab::ArgoCdProjects
+        | ResourceTab::ArgoCdRepos
+        | ResourceTab::ArgoCdClusters
+        | ResourceTab::ArgoCdAccounts
+        | ResourceTab::ArgoCdCerts
+        | ResourceTab::ArgoCdGpgKeys => {
+            "Commands: :argocd projects|repos|clusters|accounts|certs|gpg  / filter".to_string()
+        }
         ResourceTab::Pods => {
             "Commands: :logs  :shell [container]  :exec <cmd...>  :port-forward <L:R>".to_string()
         }
@@ -1820,6 +2171,14 @@ fn display_cluster_endpoint(cluster: &str) -> String {
 
 fn tab_icon(tab: ResourceTab) -> &'static str {
     match tab {
+        ResourceTab::ArgoCdApps => "󰀶",
+        ResourceTab::ArgoCdResources => "󰛀",
+        ResourceTab::ArgoCdProjects => "󰠱",
+        ResourceTab::ArgoCdRepos => "󰳏",
+        ResourceTab::ArgoCdClusters => "󰠳",
+        ResourceTab::ArgoCdAccounts => "󰀉",
+        ResourceTab::ArgoCdCerts => "󰌆",
+        ResourceTab::ArgoCdGpgKeys => "󰯄",
         ResourceTab::Pods => "󰋊",
         ResourceTab::CronJobs => "󰃰",
         ResourceTab::DaemonSets => "󰠱",
@@ -1851,6 +2210,14 @@ fn tab_icon(tab: ResourceTab) -> &'static str {
 
 fn tab_group_label(tab: ResourceTab) -> &'static str {
     match tab {
+        ResourceTab::ArgoCdApps
+        | ResourceTab::ArgoCdResources
+        | ResourceTab::ArgoCdProjects
+        | ResourceTab::ArgoCdRepos
+        | ResourceTab::ArgoCdClusters
+        | ResourceTab::ArgoCdAccounts
+        | ResourceTab::ArgoCdCerts
+        | ResourceTab::ArgoCdGpgKeys => "argocd",
         ResourceTab::Pods
         | ResourceTab::CronJobs
         | ResourceTab::DaemonSets
@@ -1880,6 +2247,7 @@ fn tab_group_label(tab: ResourceTab) -> &'static str {
 
 fn tab_group_icon(tab: ResourceTab) -> &'static str {
     match tab_group_label(tab) {
+        "argocd" => "󰀶",
         "workloads" => "󰙨",
         "service" => "󰒓",
         "config" => "󰈙",

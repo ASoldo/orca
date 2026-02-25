@@ -37,8 +37,23 @@ pub enum TableOverlayKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsInspectTarget {
-    ArgoCdApps,
-    ArgoCdApp {
+    ArgoCdSync {
+        name: String,
+    },
+    ArgoCdRefresh {
+        name: String,
+    },
+    ArgoCdDiff {
+        name: String,
+    },
+    ArgoCdHistory {
+        name: String,
+    },
+    ArgoCdRollback {
+        name: String,
+        id: String,
+    },
+    ArgoCdDelete {
         name: String,
     },
     HelmReleases,
@@ -134,6 +149,11 @@ pub enum AppCommand {
     LoadPodContainers {
         namespace: String,
         pod_name: String,
+    },
+    LoadArgoResourcePanel {
+        kind: String,
+        namespace: Option<String>,
+        name: String,
     },
     DeleteSelected {
         tab: ResourceTab,
@@ -263,6 +283,8 @@ struct ViewState {
     detail_scroll: u16,
     container_picker: Option<ContainerPickerState>,
     alert_snapshot: AlertSnapshot,
+    argocd_server: String,
+    argocd_selected_app: Option<String>,
     flow_stack: Vec<FlowState>,
     selected_indices: HashMap<ResourceTab, usize>,
 }
@@ -308,6 +330,8 @@ pub struct App {
     available_contexts: Vec<String>,
     available_clusters: Vec<String>,
     available_users: Vec<String>,
+    argocd_server: String,
+    argocd_selected_app: Option<String>,
     command_aliases: HashMap<String, String>,
     plugin_commands: Vec<PluginCommandDef>,
     hotkey_commands: Vec<HotkeyCommandDef>,
@@ -323,6 +347,10 @@ pub struct App {
 impl App {
     pub fn new(cluster: String, context: String, namespace_scope: NamespaceScope) -> Self {
         let tabs = ResourceTab::ALL.to_vec();
+        let initial_tab_index = tabs
+            .iter()
+            .position(|tab| *tab == ResourceTab::Pods)
+            .unwrap_or(0);
         let tables = tabs
             .iter()
             .copied()
@@ -336,7 +364,7 @@ impl App {
         let mut view_slots = vec![None; 10];
         let initial_slot = 1usize;
         view_slots[initial_slot] = Some(ViewState {
-            active_tab_index: 0,
+            active_tab_index: initial_tab_index,
             namespace_scope: namespace_scope.clone(),
             filter: String::new(),
             focus: FocusPane::Table,
@@ -353,6 +381,8 @@ impl App {
             detail_scroll: 0,
             container_picker: None,
             alert_snapshot: AlertSnapshot::default(),
+            argocd_server: "-".to_string(),
+            argocd_selected_app: None,
             flow_stack: Vec::new(),
             selected_indices: initial_selected_indices,
         });
@@ -363,7 +393,7 @@ impl App {
             focus: FocusPane::Table,
             detail_mode: DetailPaneMode::Dashboard,
             tabs,
-            active_tab_index: 0,
+            active_tab_index: initial_tab_index,
             tables,
             namespace_scope,
             filter: String::new(),
@@ -398,6 +428,8 @@ impl App {
             available_contexts: Vec::new(),
             available_clusters: Vec::new(),
             available_users: Vec::new(),
+            argocd_server: "-".to_string(),
+            argocd_selected_app: None,
             command_aliases: HashMap::new(),
             plugin_commands: Vec::new(),
             hotkey_commands: Vec::new(),
@@ -441,6 +473,34 @@ impl App {
 
     pub fn user(&self) -> &str {
         &self.user
+    }
+
+    pub fn argocd_server(&self) -> &str {
+        &self.argocd_server
+    }
+
+    pub fn argocd_selected_app(&self) -> Option<&str> {
+        self.argocd_selected_app.as_deref()
+    }
+
+    pub fn set_argocd_server(&mut self, server: impl Into<String>) {
+        let value = server.into();
+        if value.trim().is_empty() {
+            self.argocd_server = "-".to_string();
+        } else {
+            self.argocd_server = value;
+        }
+    }
+
+    pub fn set_argocd_selected_app(&mut self, app: Option<String>) {
+        self.argocd_selected_app = app.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
     }
 
     pub fn set_kube_target(
@@ -638,6 +698,7 @@ impl App {
         self.container_picker.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn pane_label(&self) -> &'static str {
         if self.container_picker_active() {
             return "ctr";
@@ -856,6 +917,7 @@ impl App {
         slots
     }
 
+    #[allow(dead_code)]
     pub fn active_last_refresh(&self) -> Option<String> {
         self.tables
             .get(&self.active_tab())
@@ -893,6 +955,20 @@ impl App {
     pub fn active_selected_row(&self) -> Option<&RowData> {
         let selected = self.active_selected_index()?;
         self.active_visible_rows().get(selected).copied()
+    }
+
+    pub fn selected_row_name_for(&self, tab: ResourceTab) -> Option<String> {
+        let table = self.tables.get(&tab)?;
+        let visible_rows = table
+            .rows
+            .iter()
+            .filter(|row| row.matches_filter(&self.filter))
+            .collect::<Vec<_>>();
+        if visible_rows.is_empty() {
+            return None;
+        }
+        let index = table.selected.min(visible_rows.len().saturating_sub(1));
+        visible_rows.get(index).map(|row| row.name.clone())
     }
 
     pub fn register_port_forward(
@@ -1219,7 +1295,14 @@ impl App {
                 };
                 AppCommand::None
             }
-            Action::EnterResource => self.enter_selected_resource(),
+            Action::EnterResource => {
+                if self.table_overlay_active() {
+                    self.status = "Output view is read-only (Esc to close)".to_string();
+                    AppCommand::None
+                } else {
+                    self.enter_selected_resource()
+                }
+            }
             Action::ShowDetails => self.open_selected_details(),
             Action::StartCommand => {
                 self.mode = InputMode::Command;
@@ -1645,6 +1728,8 @@ impl App {
             detail_scroll: self.detail_scroll,
             container_picker: self.container_picker.clone(),
             alert_snapshot: self.alert_snapshot.clone(),
+            argocd_server: self.argocd_server.clone(),
+            argocd_selected_app: self.argocd_selected_app.clone(),
             flow_stack: self.flow_stack.clone(),
             selected_indices,
         }
@@ -1670,6 +1755,8 @@ impl App {
         self.detail_scroll = state.detail_scroll;
         self.container_picker = state.container_picker.clone();
         self.alert_snapshot = state.alert_snapshot.clone();
+        self.argocd_server = state.argocd_server.clone();
+        self.argocd_selected_app = state.argocd_selected_app.clone();
         self.flow_stack = state.flow_stack.clone();
 
         let tabs = self.tabs.clone();
@@ -1712,6 +1799,7 @@ impl App {
             state.detail_overlay_title = None;
             state.detail_scroll = 0;
             state.container_picker = None;
+            state.argocd_selected_app = None;
             state.flow_stack = Vec::new();
             state
         };
@@ -1794,6 +1882,15 @@ impl App {
         self.clear_table_overlay();
         self.clear_container_picker();
         self.detail_scroll = 0;
+        if self.active_tab() == ResourceTab::ArgoCdResources && self.argocd_selected_app.is_none() {
+            if let Some(row) = self
+                .tables
+                .get(&ResourceTab::ArgoCdApps)
+                .and_then(|table| table.rows.get(table.selected))
+            {
+                self.argocd_selected_app = Some(row.name.clone());
+            }
+        }
         self.status = format!("Switched to {}", self.active_tab().title());
         if self
             .tables
@@ -1846,7 +1943,23 @@ impl App {
             "pulses".to_string(),
             "xray".to_string(),
             "argocd".to_string(),
+            "argo".to_string(),
             "argocd ".to_string(),
+            "argo ".to_string(),
+            "argocd apps".to_string(),
+            "argocd resources".to_string(),
+            "argocd projects".to_string(),
+            "argocd repos".to_string(),
+            "argocd clusters".to_string(),
+            "argocd accounts".to_string(),
+            "argocd certs".to_string(),
+            "argocd gpg".to_string(),
+            "argocd sync ".to_string(),
+            "argocd refresh ".to_string(),
+            "argocd diff ".to_string(),
+            "argocd history ".to_string(),
+            "argocd rollback ".to_string(),
+            "argocd delete ".to_string(),
             "helm".to_string(),
             "helm ".to_string(),
             "tf".to_string(),
@@ -1920,6 +2033,19 @@ impl App {
             }
         }
 
+        if let Some(argo_table) = self.tables.get(&ResourceTab::ArgoCdApps) {
+            for row in argo_table.rows.iter().take(120) {
+                candidates.push(format!("argocd {}", row.name));
+                candidates.push(format!("argo {}", row.name));
+                candidates.push(format!("argocd resources {}", row.name));
+                candidates.push(format!("argocd sync {}", row.name));
+                candidates.push(format!("argocd refresh {}", row.name));
+                candidates.push(format!("argocd diff {}", row.name));
+                candidates.push(format!("argocd history {}", row.name));
+                candidates.push(format!("argocd delete {}", row.name));
+            }
+        }
+
         for context in self.available_contexts.iter().take(200) {
             candidates.push(format!("ctx {context}"));
             candidates.push(format!("context {context}"));
@@ -1963,6 +2089,15 @@ impl App {
             "pulses".to_string(),
             "xray".to_string(),
             "argocd".to_string(),
+            "argo".to_string(),
+            "argocd apps".to_string(),
+            "argocd resources".to_string(),
+            "argocd projects".to_string(),
+            "argocd repos".to_string(),
+            "argocd clusters".to_string(),
+            "argocd accounts".to_string(),
+            "argocd certs".to_string(),
+            "argocd gpg".to_string(),
             "helm".to_string(),
             "tf".to_string(),
             "ansible".to_string(),
@@ -1991,6 +2126,14 @@ impl App {
 
         for crd in self.discovered_crds.iter().take(100) {
             candidates.push(format!("crd {}", crd.name));
+        }
+
+        if let Some(argo_table) = self.tables.get(&ResourceTab::ArgoCdApps) {
+            for row in argo_table.rows.iter().take(120) {
+                candidates.push(format!("argocd {}", row.name));
+                candidates.push(format!("argo {}", row.name));
+                candidates.push(format!("argocd resources {}", row.name));
+            }
         }
 
         for context in self.available_contexts.iter().take(120) {
@@ -2184,6 +2327,25 @@ impl App {
                 self.push_flow_state();
                 self.drill_into_pods(row_namespace, &row_name, false)
             }
+            ResourceTab::ArgoCdApps => {
+                let app_name = row_name;
+                self.push_flow_state();
+                self.argocd_selected_app = Some(app_name.clone());
+                let switched = self.switch_to_tab(ResourceTab::ArgoCdResources);
+                self.status = format!("Argo CD resources for {app_name}");
+                if switched == AppCommand::None {
+                    AppCommand::RefreshActive
+                } else {
+                    switched
+                }
+            }
+            ResourceTab::ArgoCdResources => self.prepare_argocd_resource_panel(),
+            ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys => self.open_selected_details(),
             _ => {
                 self.status = format!(
                     "No enter drill-down for {} (press d for details)",
@@ -2191,6 +2353,52 @@ impl App {
                 );
                 AppCommand::None
             }
+        }
+    }
+
+    fn prepare_argocd_resource_panel(&mut self) -> AppCommand {
+        let Some(row) = self.active_selected_row() else {
+            self.status = "No Argo CD resource selected".to_string();
+            return AppCommand::None;
+        };
+
+        let kind = row
+            .name
+            .split_once('/')
+            .map(|(kind, _)| kind.trim().to_string())
+            .or_else(|| row.columns.first().map(|value| value.trim().to_string()))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "resource".to_string());
+
+        let name = row
+            .columns
+            .get(2)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                row.name
+                    .split_once('/')
+                    .map(|(_, name)| name.trim().to_string())
+            })
+            .unwrap_or_else(|| row.name.clone());
+
+        let namespace = row.namespace.clone().and_then(|namespace| {
+            let trimmed = namespace.trim();
+            if trimmed.is_empty() || trimmed == "-" {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        self.status = match namespace.as_deref() {
+            Some(namespace) => format!("Loading Argo {} {namespace}/{}", kind, name),
+            None => format!("Loading Argo {} {}", kind, name),
+        };
+        AppCommand::LoadArgoResourcePanel {
+            kind,
+            namespace,
+            name,
         }
     }
 
@@ -2343,17 +2551,8 @@ impl App {
             "pulses" | "pulse" => AppCommand::InspectPulses,
             "xray" | "xr" | "x" => self.prepare_xray_command(parts.next()),
             "argocd" | "argo" => {
-                if let Some(name) = parts.next() {
-                    AppCommand::InspectOps {
-                        target: OpsInspectTarget::ArgoCdApp {
-                            name: name.to_string(),
-                        },
-                    }
-                } else {
-                    AppCommand::InspectOps {
-                        target: OpsInspectTarget::ArgoCdApps,
-                    }
-                }
+                let args = parts.map(str::to_string).collect::<Vec<_>>();
+                self.open_argocd_command(args)
             }
             "helm" => {
                 if let Some(name) = parts.next() {
@@ -2605,17 +2804,7 @@ impl App {
         }
 
         if matches!(first.as_str(), "argocd" | "argo") {
-            return if let Some(name) = parts.next() {
-                AppCommand::InspectOps {
-                    target: OpsInspectTarget::ArgoCdApp {
-                        name: name.to_string(),
-                    },
-                }
-            } else {
-                AppCommand::InspectOps {
-                    target: OpsInspectTarget::ArgoCdApps,
-                }
-            };
+            return self.open_argocd_command(parts.map(str::to_string).collect::<Vec<_>>());
         }
 
         if first == "helm" {
@@ -3210,8 +3399,244 @@ impl App {
             .replace("{args}", &joined_extra)
     }
 
+    fn open_argocd_command(&mut self, args: Vec<String>) -> AppCommand {
+        if args.is_empty() {
+            return self.switch_and_refresh_argocd_tab(
+                ResourceTab::ArgoCdApps,
+                "Argo CD application catalog",
+            );
+        }
+
+        let first_raw = args[0].trim().to_string();
+        let first = resolve_command_token(&first_raw);
+        let second_raw = args.get(1).map(String::as_str).unwrap_or_default();
+        let second = resolve_command_token(second_raw);
+
+        match first.as_str() {
+            "apps" | "app" | "list" => self.switch_and_refresh_argocd_tab(
+                ResourceTab::ArgoCdApps,
+                "Argo CD application catalog",
+            ),
+            "resources" | "res" | "tree" => {
+                if let Some(explicit_app) = args.get(1).map(String::as_str) {
+                    let explicit_app = explicit_app.trim();
+                    if !explicit_app.is_empty() {
+                        self.argocd_selected_app = Some(explicit_app.to_string());
+                    }
+                }
+
+                let Some(app_name) = self.resolve_argocd_app_target(None) else {
+                    self.status = "No Argo CD app selected. Use :argocd <app> or Enter on ArgoApps"
+                        .to_string();
+                    return AppCommand::None;
+                };
+                self.argocd_selected_app = Some(app_name.clone());
+                self.switch_and_refresh_argocd_tab(
+                    ResourceTab::ArgoCdResources,
+                    format!("Argo CD resources for {app_name}"),
+                )
+            }
+            "projects" | "project" | "proj" | "argoproj" => self.switch_and_refresh_argocd_tab(
+                ResourceTab::ArgoCdProjects,
+                "Argo CD projects catalog",
+            ),
+            "repos" | "repo" | "repositories" | "repository" => {
+                self.switch_and_refresh_argocd_tab(ResourceTab::ArgoCdRepos, "Argo CD repositories")
+            }
+            "clusters" | "cluster" | "cls" => {
+                self.switch_and_refresh_argocd_tab(ResourceTab::ArgoCdClusters, "Argo CD clusters")
+            }
+            "accounts" | "account" | "acct" => {
+                self.switch_and_refresh_argocd_tab(ResourceTab::ArgoCdAccounts, "Argo CD accounts")
+            }
+            "certs" | "cert" | "certificates" | "known-hosts" | "knownhosts" => {
+                self.switch_and_refresh_argocd_tab(ResourceTab::ArgoCdCerts, "Argo CD certificates")
+            }
+            "gpg" | "gpgkeys" | "gpg-keys" => {
+                self.switch_and_refresh_argocd_tab(ResourceTab::ArgoCdGpgKeys, "Argo CD GPG keys")
+            }
+            "sync" => self.prepare_argocd_action(
+                args.get(1).map(String::as_str),
+                "sync",
+                |name| OpsInspectTarget::ArgoCdSync { name },
+                true,
+            ),
+            "refresh" => self.prepare_argocd_action(
+                args.get(1).map(String::as_str),
+                "refresh",
+                |name| OpsInspectTarget::ArgoCdRefresh { name },
+                false,
+            ),
+            "diff" => self.prepare_argocd_action(
+                args.get(1).map(String::as_str),
+                "diff",
+                |name| OpsInspectTarget::ArgoCdDiff { name },
+                false,
+            ),
+            "history" => self.prepare_argocd_action(
+                args.get(1).map(String::as_str),
+                "history",
+                |name| OpsInspectTarget::ArgoCdHistory { name },
+                false,
+            ),
+            "rollback" => {
+                if args.len() < 2 {
+                    self.status = "Usage: :argocd rollback <history-id> [app]".to_string();
+                    return AppCommand::None;
+                }
+                if !self.ensure_write_allowed("argocd rollback") {
+                    return AppCommand::None;
+                }
+
+                let (rollback_id, maybe_app) = if second.chars().all(|ch| ch.is_ascii_digit()) {
+                    (second_raw.trim(), args.get(2).map(String::as_str))
+                } else {
+                    let third = args.get(2).map(String::as_str).unwrap_or_default();
+                    let third_norm = resolve_command_token(third);
+                    if third_norm.chars().all(|ch| ch.is_ascii_digit()) {
+                        (third.trim(), args.get(1).map(String::as_str))
+                    } else {
+                        self.status = "Usage: :argocd rollback <history-id> [app]".to_string();
+                        return AppCommand::None;
+                    }
+                };
+
+                if rollback_id.is_empty() {
+                    self.status = "Usage: :argocd rollback <history-id> [app]".to_string();
+                    return AppCommand::None;
+                }
+                let Some(app_name) = self.resolve_argocd_app_target(maybe_app) else {
+                    self.status = "No Argo CD app selected for rollback".to_string();
+                    return AppCommand::None;
+                };
+                self.argocd_selected_app = Some(app_name.clone());
+                self.status = format!("Rolling back Argo CD app {app_name} to {rollback_id}");
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::ArgoCdRollback {
+                        name: app_name,
+                        id: rollback_id.to_string(),
+                    },
+                }
+            }
+            "delete" | "del" => {
+                if !self.ensure_write_allowed("argocd delete") {
+                    return AppCommand::None;
+                }
+                let Some(app_name) =
+                    self.resolve_argocd_app_target(args.get(1).map(String::as_str))
+                else {
+                    self.status = "No Argo CD app selected for delete".to_string();
+                    return AppCommand::None;
+                };
+                self.argocd_selected_app = Some(app_name.clone());
+                self.status = format!("Deleting Argo CD app {app_name}");
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::ArgoCdDelete { name: app_name },
+                }
+            }
+            _ => {
+                let app_name = first_raw.trim();
+                if app_name.is_empty() {
+                    self.status = "Argo CD application target is empty".to_string();
+                    return AppCommand::None;
+                }
+                self.argocd_selected_app = Some(app_name.to_string());
+                self.switch_and_refresh_argocd_tab(
+                    ResourceTab::ArgoCdResources,
+                    format!("Argo CD resources for {app_name}"),
+                )
+            }
+        }
+    }
+
+    fn switch_and_refresh_argocd_tab(
+        &mut self,
+        tab: ResourceTab,
+        status: impl Into<String>,
+    ) -> AppCommand {
+        let command = self.switch_to_tab(tab);
+        self.status = status.into();
+        if command == AppCommand::None {
+            AppCommand::RefreshActive
+        } else {
+            command
+        }
+    }
+
+    fn resolve_argocd_app_target(&self, explicit: Option<&str>) -> Option<String> {
+        explicit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.argocd_selected_app.clone())
+            .or_else(|| self.selected_row_name_for(ResourceTab::ArgoCdApps))
+    }
+
+    fn prepare_argocd_action<F>(
+        &mut self,
+        explicit_app: Option<&str>,
+        action_label: &str,
+        target_builder: F,
+        mutating: bool,
+    ) -> AppCommand
+    where
+        F: FnOnce(String) -> OpsInspectTarget,
+    {
+        if mutating && !self.ensure_write_allowed(&format!("argocd {action_label}")) {
+            return AppCommand::None;
+        }
+        let Some(app_name) = self.resolve_argocd_app_target(explicit_app) else {
+            self.status = format!("No Argo CD app selected for {action_label}");
+            return AppCommand::None;
+        };
+        self.argocd_selected_app = Some(app_name.clone());
+        self.status = format!(
+            "Argo CD {action_label} {}",
+            self.argocd_selected_app.as_deref().unwrap_or("-")
+        );
+        AppCommand::InspectOps {
+            target: target_builder(app_name),
+        }
+    }
+
     fn handle_tab_shortcut(&mut self, tab: ResourceTab, remainder: &str) -> AppCommand {
         let remainder = remainder.trim();
+        if matches!(
+            tab,
+            ResourceTab::ArgoCdApps
+                | ResourceTab::ArgoCdResources
+                | ResourceTab::ArgoCdProjects
+                | ResourceTab::ArgoCdRepos
+                | ResourceTab::ArgoCdClusters
+                | ResourceTab::ArgoCdAccounts
+                | ResourceTab::ArgoCdCerts
+                | ResourceTab::ArgoCdGpgKeys
+        ) {
+            let mut args = Vec::<String>::new();
+            if tab == ResourceTab::ArgoCdApps && !remainder.is_empty() {
+                args.extend(remainder.split_whitespace().map(str::to_string));
+            } else {
+                args.push(
+                    match tab {
+                        ResourceTab::ArgoCdApps => "apps",
+                        ResourceTab::ArgoCdResources => "resources",
+                        ResourceTab::ArgoCdProjects => "projects",
+                        ResourceTab::ArgoCdRepos => "repos",
+                        ResourceTab::ArgoCdClusters => "clusters",
+                        ResourceTab::ArgoCdAccounts => "accounts",
+                        ResourceTab::ArgoCdCerts => "certs",
+                        ResourceTab::ArgoCdGpgKeys => "gpg",
+                        _ => "apps",
+                    }
+                    .to_string(),
+                );
+                if !remainder.is_empty() {
+                    args.extend(remainder.split_whitespace().map(str::to_string));
+                }
+            }
+            return self.open_argocd_command(args);
+        }
+
         let command = self.switch_to_tab(tab);
         if remainder.is_empty() {
             return command;
@@ -3313,7 +3738,19 @@ impl App {
         }
 
         let tab = self.active_tab();
-        if matches!(tab, ResourceTab::Events | ResourceTab::CustomResources) {
+        if matches!(
+            tab,
+            ResourceTab::Events
+                | ResourceTab::CustomResources
+                | ResourceTab::ArgoCdApps
+                | ResourceTab::ArgoCdResources
+                | ResourceTab::ArgoCdProjects
+                | ResourceTab::ArgoCdRepos
+                | ResourceTab::ArgoCdClusters
+                | ResourceTab::ArgoCdAccounts
+                | ResourceTab::ArgoCdCerts
+                | ResourceTab::ArgoCdGpgKeys
+        ) {
             self.status = format!("Delete is not supported for {}", tab.title());
             return AppCommand::None;
         }
@@ -3347,7 +3784,7 @@ impl App {
                 name,
             },
         });
-        self.status = format!("{prompt}? [y/n]");
+        self.status = format!("{prompt}? (y/n)");
         AppCommand::None
     }
 
@@ -3381,7 +3818,7 @@ impl App {
                 name,
             },
         });
-        self.status = format!("{prompt}? [y/n]");
+        self.status = format!("{prompt}? (y/n)");
         AppCommand::None
     }
 
@@ -3463,20 +3900,22 @@ impl App {
             return AppCommand::None;
         }
 
-        if self.active_tab() != ResourceTab::Pods {
-            self.status = "Shell access is only available from the Pods tab".to_string();
-            return AppCommand::None;
-        }
-
-        let Some(row) = self.active_selected_row() else {
-            self.status = "No selected pod".to_string();
+        let (namespace, pod_name) = if self.active_tab() == ResourceTab::Pods {
+            let Some(row) = self.active_selected_row() else {
+                self.status = "No selected pod".to_string();
+                return AppCommand::None;
+            };
+            let Some(namespace) = row.namespace.clone() else {
+                self.status = "Selected pod has no namespace".to_string();
+                return AppCommand::None;
+            };
+            (namespace, row.name.clone())
+        } else if let Some((namespace, pod_name)) = self.selected_argocd_pod_target() {
+            (namespace, pod_name)
+        } else {
+            self.status = "Shell access is available from Pods or Argo Pod nodes".to_string();
             return AppCommand::None;
         };
-        let Some(namespace) = row.namespace.clone() else {
-            self.status = "Selected pod has no namespace".to_string();
-            return AppCommand::None;
-        };
-        let pod_name = row.name.clone();
         self.status = match container.as_deref() {
             Some(container) => format!(
                 "Opening shell in {namespace}/{pod_name} (container: {container}, shell: {shell})"
@@ -3489,6 +3928,33 @@ impl App {
             container,
             shell,
         }
+    }
+
+    fn selected_argocd_pod_target(&self) -> Option<(String, String)> {
+        if self.active_tab() != ResourceTab::ArgoCdResources {
+            return None;
+        }
+        let row = self.active_selected_row()?;
+        let (kind, fallback_name) = row.name.split_once('/')?;
+        if !kind.eq_ignore_ascii_case("pod") {
+            return None;
+        }
+        let namespace = row
+            .namespace
+            .clone()
+            .or_else(|| row.columns.get(1).cloned())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "-")?;
+        let pod_name = row
+            .columns
+            .get(2)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "-")
+            .unwrap_or_else(|| fallback_name.trim().to_string());
+        if pod_name.is_empty() {
+            return None;
+        }
+        Some((namespace, pod_name))
     }
 
     fn prepare_edit_command(&mut self) -> AppCommand {
@@ -3603,6 +4069,14 @@ impl App {
 
     fn kubectl_resource_for_tab(&self, tab: ResourceTab) -> Option<(String, bool)> {
         match tab {
+            ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys => None,
             ResourceTab::Pods => Some(("pod".to_string(), true)),
             ResourceTab::CronJobs => Some(("cronjob".to_string(), true)),
             ResourceTab::DaemonSets => Some(("daemonset".to_string(), true)),
@@ -3687,6 +4161,19 @@ impl App {
         }
 
         if self.active_tab() != ResourceTab::Pods {
+            if let Some((namespace, pod_name)) = self.selected_argocd_pod_target() {
+                self.status = if previous {
+                    format!("Fetching previous logs for pod '{pod_name}' in '{namespace}'")
+                } else {
+                    format!("Fetching logs for pod '{pod_name}' in '{namespace}'")
+                };
+                return AppCommand::LoadPodLogs {
+                    namespace,
+                    pod_name,
+                    container: None,
+                    previous,
+                };
+            }
             self.status =
                 "Logs are available from Pods (or use Shift+L for workload logs)".to_string();
             return AppCommand::None;
@@ -4132,6 +4619,9 @@ fn summarize_error_line(error: &str) -> String {
 }
 
 fn normalize_status_text(status: String) -> String {
+    if status.contains("(y/n)") || status.contains("[y/n]") {
+        return status;
+    }
     const MAX_STATUS_LEN: usize = 180;
     if status.chars().count() <= MAX_STATUS_LEN {
         return status;
@@ -4149,7 +4639,7 @@ fn normalize_status_text(status: String) -> String {
 mod tests {
     use super::{
         App, AppCommand, DetailPaneMode, HotkeyCommandDef, OpsInspectTarget, PluginCommandDef,
-        PluginRun, normalize_mode_prefixed_input,
+        PluginRun, normalize_mode_prefixed_input, normalize_status_text,
     };
     use crate::input::Action;
     use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
@@ -4239,7 +4729,7 @@ mod tests {
     }
 
     #[test]
-    fn argocd_command_requests_apps_overlay() {
+    fn argocd_command_switches_to_argo_apps_tab() {
         let mut app = App::new(
             "cluster".to_string(),
             "context".to_string(),
@@ -4252,10 +4742,176 @@ mod tests {
         }
 
         let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_tab(), ResourceTab::ArgoCdApps);
+    }
+
+    #[test]
+    fn argocd_with_app_name_switches_to_resource_tab() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "argocd guestbook".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_tab(), ResourceTab::ArgoCdResources);
+        assert_eq!(app.argocd_selected_app(), Some("guestbook"));
+    }
+
+    #[test]
+    fn open_shell_from_argocd_pod_node_targets_selected_pod() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut resources = TableData::default();
+        resources.set_rows(
+            vec![
+                "Tree".to_string(),
+                "Namespace".to_string(),
+                "Name".to_string(),
+            ],
+            vec![RowData {
+                name: "Pod/guestbook-ui-6595f948db-abcde".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                columns: vec![
+                    "└── Pod".to_string(),
+                    "argocd-demo".to_string(),
+                    "guestbook-ui-6595f948db-abcde".to_string(),
+                ],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdResources, resources);
+        app.switch_to_tab(ResourceTab::ArgoCdResources);
+
+        let cmd = app.apply_action(Action::OpenPodShell);
+        assert_eq!(
+            cmd,
+            AppCommand::OpenPodShell {
+                namespace: "argocd-demo".to_string(),
+                pod_name: "guestbook-ui-6595f948db-abcde".to_string(),
+                container: None,
+                shell: "auto".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn load_logs_from_argocd_pod_node_targets_selected_pod() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut resources = TableData::default();
+        resources.set_rows(
+            vec![
+                "Tree".to_string(),
+                "Namespace".to_string(),
+                "Name".to_string(),
+            ],
+            vec![RowData {
+                name: "Pod/guestbook-ui-6595f948db-abcde".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                columns: vec![
+                    "└── Pod".to_string(),
+                    "argocd-demo".to_string(),
+                    "guestbook-ui-6595f948db-abcde".to_string(),
+                ],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdResources, resources);
+        app.switch_to_tab(ResourceTab::ArgoCdResources);
+
+        let cmd = app.apply_action(Action::LoadPodLogs);
+        assert_eq!(
+            cmd,
+            AppCommand::LoadPodLogs {
+                namespace: "argocd-demo".to_string(),
+                pod_name: "guestbook-ui-6595f948db-abcde".to_string(),
+                container: None,
+                previous: false,
+            }
+        );
+    }
+
+    #[test]
+    fn argocd_projects_switches_to_projects_tab() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "argocd projects".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_tab(), ResourceTab::ArgoCdProjects);
+    }
+
+    #[test]
+    fn argocd_sync_builds_ops_target() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "argocd sync guestbook".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(
             cmd,
             AppCommand::InspectOps {
-                target: OpsInspectTarget::ArgoCdApps
+                target: OpsInspectTarget::ArgoCdSync {
+                    name: "guestbook".to_string()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn argocd_rollback_accepts_id_and_app() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "argocd rollback 3 guestbook".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::ArgoCdRollback {
+                    name: "guestbook".to_string(),
+                    id: "3".to_string(),
+                }
             }
         );
     }
@@ -4998,6 +5654,12 @@ mod tests {
                 .any(|candidate| candidate.starts_with("tab ")),
             "legacy tab-prefix completions should be hidden"
         );
+    }
+
+    #[test]
+    fn normalize_status_text_keeps_confirmation_prompt_untrimmed() {
+        let prompt = format!("{} (y/n)", "x".repeat(260));
+        assert_eq!(normalize_status_text(prompt.clone()), prompt);
     }
 
     #[test]

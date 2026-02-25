@@ -8,6 +8,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use app::{App, AppCommand, OpsInspectTarget, PluginRun};
+use chrono::Local;
 use clap::Parser;
 use cli::CliArgs;
 use crossterm::event::{
@@ -34,10 +35,12 @@ use k8s_openapi::api::storage::v1::StorageClass;
 use kube::runtime::watcher::{Config as WatchConfig, watcher};
 use kube::{Api, Client};
 use model::{NamespaceScope, ResourceTab};
+use model::{RowData, TableData};
 use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Stdout, Write};
 use std::path::{Path, PathBuf};
@@ -583,6 +586,27 @@ async fn execute_app_command(
                 ));
             }
         },
+        AppCommand::LoadArgoResourcePanel {
+            kind,
+            namespace,
+            name,
+        } => match fetch_argocd_resource_panel(&kind, namespace.as_deref(), &name).await {
+            Ok((title, panel)) => {
+                app.set_detail_overlay(title, panel);
+                app.set_status(match namespace.as_deref() {
+                    Some(namespace) => format!("Argo panel loaded for {kind} {namespace}/{name}"),
+                    None => format!("Argo panel loaded for {kind} {name}"),
+                });
+            }
+            Err(error) => {
+                let title = match namespace.as_deref() {
+                    Some(namespace) => format!("Argo {kind} {namespace}/{name}"),
+                    None => format!("Argo {kind} {name}"),
+                };
+                app.set_detail_overlay(title, error.clone());
+                app.set_status(format!("Argo panel load failed: {error}"));
+            }
+        },
         AppCommand::DeleteSelected {
             tab,
             namespace,
@@ -791,9 +815,33 @@ async fn execute_app_command(
             }
         },
         AppCommand::InspectOps { target } => {
+            let refresh_target = target.clone();
             let (title, report, status) = inspect_ops_target(target, app.namespace_scope()).await;
             app.set_output_overlay(title, report);
             app.set_status(status);
+            if matches!(
+                refresh_target,
+                OpsInspectTarget::ArgoCdSync { .. }
+                    | OpsInspectTarget::ArgoCdRefresh { .. }
+                    | OpsInspectTarget::ArgoCdRollback { .. }
+                    | OpsInspectTarget::ArgoCdDelete { .. }
+            ) {
+                refresh_tab(app, gateway, ResourceTab::ArgoCdApps).await;
+                if matches!(
+                    app.active_tab(),
+                    ResourceTab::ArgoCdResources
+                        | ResourceTab::ArgoCdApps
+                        | ResourceTab::ArgoCdProjects
+                        | ResourceTab::ArgoCdRepos
+                        | ResourceTab::ArgoCdClusters
+                        | ResourceTab::ArgoCdAccounts
+                        | ResourceTab::ArgoCdCerts
+                        | ResourceTab::ArgoCdGpgKeys
+                ) {
+                    let active = app.active_tab();
+                    refresh_tab(app, gateway, active).await;
+                }
+            }
         }
         AppCommand::InspectXray {
             tab,
@@ -1070,33 +1118,114 @@ async fn inspect_ops_target(
     namespace_scope: &NamespaceScope,
 ) -> (String, String, String) {
     match target {
-        OpsInspectTarget::ArgoCdApps => {
-            let args = vec!["app".to_string(), "list".to_string()];
-            match run_external_readonly("argocd", &args, 6).await {
+        OpsInspectTarget::ArgoCdSync { name } => {
+            let args = vec!["app".to_string(), "sync".to_string(), name.clone()];
+            match run_external_readonly("argocd", &args, 30).await {
                 Ok(output) => (
-                    "Argo CD Applications".to_string(),
-                    bounded_output(&output, 220, 220),
-                    "Argo CD application catalog loaded".to_string(),
+                    format!("Argo CD Sync {name}"),
+                    bounded_output(&output, 260, 220),
+                    format!("Argo CD sync completed: {name}"),
                 ),
                 Err(error) => (
-                    "Argo CD Applications".to_string(),
-                    error,
-                    "Argo CD application catalog failed".to_string(),
+                    format!("Argo CD Sync {name}"),
+                    error.clone(),
+                    format!("Argo CD sync failed: {error}"),
                 ),
             }
         }
-        OpsInspectTarget::ArgoCdApp { name } => {
-            let args = vec!["app".to_string(), "get".to_string(), name.clone()];
-            match run_external_readonly("argocd", &args, 6).await {
+        OpsInspectTarget::ArgoCdRefresh { name } => {
+            let args = vec![
+                "app".to_string(),
+                "get".to_string(),
+                name.clone(),
+                "--refresh".to_string(),
+            ];
+            match run_external_readonly("argocd", &args, 15).await {
                 Ok(output) => (
-                    format!("Argo CD App {}", name),
-                    bounded_output(&output, 260, 220),
-                    format!("Argo CD app loaded: {name}"),
+                    format!("Argo CD Refresh {name}"),
+                    bounded_output(&output, 220, 220),
+                    format!("Argo CD refresh completed: {name}"),
                 ),
                 Err(error) => (
-                    format!("Argo CD App {}", name),
-                    error,
-                    format!("Argo CD app lookup failed: {name}"),
+                    format!("Argo CD Refresh {name}"),
+                    error.clone(),
+                    format!("Argo CD refresh failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::ArgoCdDiff { name } => {
+            let args = vec!["app".to_string(), "diff".to_string(), name.clone()];
+            match run_external_readonly("argocd", &args, 20).await {
+                Ok(output) => (
+                    format!("Argo CD Diff {name}"),
+                    bounded_output(&output, 320, 220),
+                    format!("Argo CD diff loaded: {name}"),
+                ),
+                Err(error) => (
+                    format!("Argo CD Diff {name}"),
+                    error.clone(),
+                    format!("Argo CD diff failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::ArgoCdHistory { name } => {
+            let args = vec![
+                "app".to_string(),
+                "history".to_string(),
+                name.clone(),
+                "-o".to_string(),
+                "json".to_string(),
+            ];
+            match run_external_readonly("argocd", &args, 12).await {
+                Ok(output) => (
+                    format!("Argo CD History {name}"),
+                    bounded_output(&output, 220, 220),
+                    format!("Argo CD history loaded: {name}"),
+                ),
+                Err(error) => (
+                    format!("Argo CD History {name}"),
+                    error.clone(),
+                    format!("Argo CD history failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::ArgoCdRollback { name, id } => {
+            let args = vec![
+                "app".to_string(),
+                "rollback".to_string(),
+                name.clone(),
+                id.clone(),
+            ];
+            match run_external_readonly("argocd", &args, 20).await {
+                Ok(output) => (
+                    format!("Argo CD Rollback {name}#{id}"),
+                    bounded_output(&output, 220, 220),
+                    format!("Argo CD rollback completed: {name}#{id}"),
+                ),
+                Err(error) => (
+                    format!("Argo CD Rollback {name}#{id}"),
+                    error.clone(),
+                    format!("Argo CD rollback failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::ArgoCdDelete { name } => {
+            let args = vec![
+                "app".to_string(),
+                "delete".to_string(),
+                name.clone(),
+                "--yes".to_string(),
+            ];
+            match run_external_readonly("argocd", &args, 20).await {
+                Ok(output) => (
+                    format!("Argo CD Delete {name}"),
+                    bounded_output(&output, 220, 220),
+                    format!("Argo CD app deleted: {name}"),
+                ),
+                Err(error) => (
+                    format!("Argo CD Delete {name}"),
+                    error.clone(),
+                    format!("Argo CD delete failed: {error}"),
                 ),
             }
         }
@@ -1838,6 +1967,47 @@ async fn run_external_readonly(
     }
 }
 
+async fn run_external_json(
+    program: &str,
+    args: &[String],
+    timeout_secs: u64,
+) -> std::result::Result<Value, String> {
+    let mut cmd = TokioCommand::new(program);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| format!("{program} timed out after {timeout_secs}s"))?
+        .map_err(|error| format!("{program}: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        let rendered = if stdout.is_empty() {
+            stderr
+        } else if stderr.is_empty() {
+            stdout
+        } else {
+            format!("{stdout}\n\nstderr:\n{stderr}")
+        };
+        if rendered.is_empty() {
+            return Err(format!("{program} exited with {}", output.status));
+        }
+        return Err(format!(
+            "{program} failed:\n{}",
+            bounded_output(&rendered, 80, 220)
+        ));
+    }
+
+    serde_json::from_str::<Value>(&stdout).map_err(|error| {
+        format!(
+            "{program} returned invalid JSON: {error}\n{}",
+            bounded_output(&stdout, 40, 220)
+        )
+    })
+}
+
 async fn run_plugin_command(run: &PluginRun) -> Result<String> {
     let timeout_secs = run.timeout_secs.max(1);
     let attempts = usize::from(run.retries).saturating_add(1);
@@ -2009,6 +2179,21 @@ fn discover_ansible_playbooks(root: &str, max_depth: usize, max_files: usize) ->
 }
 
 async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
+    if matches!(
+        tab,
+        ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys
+    ) {
+        refresh_argocd_tab(app, tab).await;
+        return;
+    }
+
     let scope = app.namespace_scope().clone();
     let selected_custom = app.selected_custom_resource().cloned();
     match timeout(
@@ -2065,6 +2250,1313 @@ async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
                 tab.title()
             ));
         }
+    }
+}
+
+async fn refresh_argocd_tab(app: &mut App, tab: ResourceTab) {
+    if let Some(server) = fetch_argocd_server().await {
+        app.set_argocd_server(server);
+    }
+
+    match tab {
+        ResourceTab::ArgoCdApps => match fetch_argocd_apps_table().await {
+            Ok(table) => {
+                app.set_active_table_data(tab, table);
+                if let Some(selected_app) = app.selected_row_name_for(ResourceTab::ArgoCdApps) {
+                    app.set_argocd_selected_app(Some(selected_app));
+                }
+            }
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdResources => {
+            let selected_app = app
+                .argocd_selected_app()
+                .map(str::to_string)
+                .or_else(|| app.selected_row_name_for(ResourceTab::ArgoCdApps));
+            app.set_argocd_selected_app(selected_app.clone());
+
+            let Some(app_name) = selected_app else {
+                let mut table = TableData::default();
+                table.set_rows(
+                    vec![
+                        "Kind".to_string(),
+                        "Namespace".to_string(),
+                        "Name".to_string(),
+                        "Sync".to_string(),
+                        "Health".to_string(),
+                        "Hook".to_string(),
+                        "Wave".to_string(),
+                    ],
+                    Vec::new(),
+                    Local::now(),
+                );
+                app.set_active_table_data(tab, table);
+                app.set_status("Select an Argo CD app first (Enter on ArgoApps)");
+                return;
+            };
+
+            match fetch_argocd_resources_table(&app_name).await {
+                Ok(table) => app.set_active_table_data(tab, table),
+                Err(error) => app.set_active_tab_error(tab, error),
+            }
+        }
+        ResourceTab::ArgoCdProjects => match fetch_argocd_projects_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdRepos => match fetch_argocd_repos_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdClusters => match fetch_argocd_clusters_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdAccounts => match fetch_argocd_accounts_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdCerts => match fetch_argocd_certs_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        ResourceTab::ArgoCdGpgKeys => match fetch_argocd_gpg_table().await {
+            Ok(table) => app.set_active_table_data(tab, table),
+            Err(error) => app.set_active_tab_error(tab, error),
+        },
+        _ => {}
+    }
+}
+
+async fn fetch_argocd_server() -> Option<String> {
+    let output = run_external_readonly("argocd", &["context".to_string()], 5)
+        .await
+        .ok()?;
+    parse_argocd_context_server(&output)
+}
+
+fn parse_argocd_context_server(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("CURRENT") {
+            continue;
+        }
+        if let Some(stripped) = trimmed.strip_prefix('*') {
+            let parts = stripped.split_whitespace().collect::<Vec<_>>();
+            if let Some(server) = parts.last() {
+                return Some((*server).to_string());
+            }
+        }
+    }
+
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("CURRENT"))
+        .and_then(|line| line.split_whitespace().last().map(str::to_string))
+}
+
+async fn fetch_argocd_apps_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "app".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        10,
+    )
+    .await?;
+    let apps = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd app list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in apps {
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let project = item
+            .pointer("/spec/project")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let dest_namespace = item
+            .pointer("/spec/destination/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let sync = item
+            .pointer("/status/sync/status")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let health = item
+            .pointer("/status/health/status")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let repo = item
+            .pointer("/spec/source/repoURL")
+            .and_then(Value::as_str)
+            .map(short_repo_label)
+            .unwrap_or_else(|| "-".to_string());
+        let path = item
+            .pointer("/spec/source/path")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: name.clone(),
+            namespace: Some(dest_namespace.clone()),
+            columns: vec![name, project, dest_namespace, sync, health, repo, path],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Name".to_string(),
+            "Project".to_string(),
+            "Namespace".to_string(),
+            "Sync".to_string(),
+            "Health".to_string(),
+            "Repo".to_string(),
+            "Path".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "app".to_string(),
+            "get".to_string(),
+            app_name.to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        12,
+    )
+    .await?;
+
+    let resources = payload
+        .pointer("/status/resources")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    #[derive(Debug, Clone)]
+    struct ArgoTreeNode {
+        kind: String,
+        namespace: String,
+        name: String,
+        sync: String,
+        health: String,
+        hook: String,
+        wave: String,
+        parent: Option<String>,
+        detail: String,
+    }
+
+    fn node_key(kind: &str, namespace: &str, name: &str) -> String {
+        format!("{}|{}|{}", namespace.trim(), kind.trim(), name.trim())
+    }
+
+    fn owner_key(namespace: &str, owner_kind: &str, owner_name: &str) -> String {
+        node_key(owner_kind, namespace, owner_name)
+    }
+
+    fn kind_rank(kind: &str) -> u8 {
+        match kind.to_ascii_lowercase().as_str() {
+            "service" => 1,
+            "configmap" => 2,
+            "secret" => 3,
+            "deployment" => 10,
+            "statefulset" => 11,
+            "daemonset" => 12,
+            "job" => 13,
+            "cronjob" => 14,
+            "replicaset" => 20,
+            "pod" => 30,
+            _ => 100,
+        }
+    }
+
+    fn kind_icon(kind: &str) -> &'static str {
+        match kind.to_ascii_lowercase().as_str() {
+            "pod" => "󰋊",
+            "deployment" => "󰹑",
+            "replicaset" => "󰹍",
+            "statefulset" => "󰛨",
+            "daemonset" => "󰠱",
+            "job" => "󰁨",
+            "cronjob" => "󰃰",
+            "service" => "󰒓",
+            "configmap" => "󰈙",
+            "secret" => "󰌋",
+            "namespace" => "󰉖",
+            "node" => "󰣇",
+            _ => "󰈔",
+        }
+    }
+
+    fn rs_health(item: &Value) -> String {
+        let replicas = item
+            .pointer("/status/replicas")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let ready = item
+            .pointer("/status/readyReplicas")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if replicas == 0 {
+            "ScaledDown".to_string()
+        } else if ready >= replicas {
+            "Healthy".to_string()
+        } else {
+            "Progressing".to_string()
+        }
+    }
+
+    fn pod_health(item: &Value) -> String {
+        item.pointer("/status/phase")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown")
+            .to_string()
+    }
+
+    fn render_tree_rows(
+        key: &str,
+        nodes: &HashMap<String, ArgoTreeNode>,
+        children: &HashMap<String, Vec<String>>,
+        ancestor_last: &[bool],
+        is_last: bool,
+        rows: &mut Vec<RowData>,
+        visited: &mut HashSet<String>,
+    ) {
+        if !visited.insert(key.to_string()) {
+            return;
+        }
+        let Some(node) = nodes.get(key) else {
+            return;
+        };
+
+        let mut prefix = String::new();
+        for ancestor_is_last in ancestor_last {
+            prefix.push_str(if *ancestor_is_last { "   " } else { "│  " });
+        }
+        if !ancestor_last.is_empty() || node.parent.is_some() {
+            prefix.push_str(if is_last { "└─ " } else { "├─ " });
+        }
+        let tree_kind = format!("{prefix}{} {}", kind_icon(&node.kind), node.kind);
+        rows.push(RowData {
+            name: format!("{}/{}", node.kind, node.name),
+            namespace: Some(node.namespace.clone()),
+            columns: vec![
+                tree_kind,
+                node.namespace.clone(),
+                node.name.clone(),
+                node.sync.clone(),
+                node.health.clone(),
+                node.hook.clone(),
+                node.wave.clone(),
+            ],
+            detail: node.detail.clone(),
+        });
+
+        let branch = children.get(key).cloned().unwrap_or_default();
+        if branch.is_empty() {
+            return;
+        }
+        for (index, child_key) in branch.iter().enumerate() {
+            let mut next_ancestors = ancestor_last.to_vec();
+            next_ancestors.push(is_last);
+            render_tree_rows(
+                child_key,
+                nodes,
+                children,
+                &next_ancestors,
+                index == branch.len().saturating_sub(1),
+                rows,
+                visited,
+            );
+        }
+    }
+
+    let mut nodes = HashMap::<String, ArgoTreeNode>::new();
+    let mut root_keys = Vec::<String>::new();
+    let mut tracked_deployments = HashSet::<String>::new();
+    let mut tracked_statefulsets = HashSet::<String>::new();
+    let mut tracked_daemonsets = HashSet::<String>::new();
+    let mut tracked_jobs = HashSet::<String>::new();
+    let mut tracked_replicasets = HashSet::<String>::new();
+
+    for item in resources {
+        let kind = item
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let namespace = item
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let sync = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let health = item
+            .pointer("/health/status")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let hook = item
+            .get("hookType")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("hook").and_then(Value::as_str))
+            .unwrap_or("-")
+            .to_string();
+        let wave = item
+            .get("syncWave")
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .map(|wave| wave.to_string())
+                    .or_else(|| value.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        let key = node_key(&kind, &namespace, &name);
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        nodes.insert(
+            key.clone(),
+            ArgoTreeNode {
+                kind: kind.clone(),
+                namespace: namespace.clone(),
+                name: name.clone(),
+                sync,
+                health,
+                hook,
+                wave,
+                parent: None,
+                detail,
+            },
+        );
+        root_keys.push(key.clone());
+
+        let set_key = format!("{}|{}", namespace, name);
+        match kind.to_ascii_lowercase().as_str() {
+            "deployment" => {
+                tracked_deployments.insert(set_key);
+            }
+            "statefulset" => {
+                tracked_statefulsets.insert(set_key);
+            }
+            "daemonset" => {
+                tracked_daemonsets.insert(set_key);
+            }
+            "job" => {
+                tracked_jobs.insert(set_key);
+            }
+            "replicaset" => {
+                tracked_replicasets.insert(set_key);
+            }
+            _ => {}
+        }
+    }
+
+    let namespaces = nodes
+        .values()
+        .map(|node| node.namespace.clone())
+        .filter(|namespace| !namespace.is_empty() && namespace != "-")
+        .collect::<HashSet<_>>();
+
+    for namespace in namespaces {
+        let payload = run_external_json(
+            "kubectl",
+            &[
+                "get".to_string(),
+                "replicasets,pods".to_string(),
+                "-n".to_string(),
+                namespace.clone(),
+                "-o".to_string(),
+                "json".to_string(),
+            ],
+            10,
+        )
+        .await;
+        let Ok(payload) = payload else {
+            continue;
+        };
+        let items = payload
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        for item in &items {
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if !kind.eq_ignore_ascii_case("replicaset") {
+                continue;
+            }
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let owner = item
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .and_then(|owners| owners.first())
+                .cloned();
+            let Some(owner) = owner else {
+                continue;
+            };
+            let owner_kind = owner.get("kind").and_then(Value::as_str).unwrap_or("");
+            let owner_name = owner.get("name").and_then(Value::as_str).unwrap_or("");
+            if owner_name.is_empty() || owner_kind.is_empty() {
+                continue;
+            }
+
+            let owner_set_key = format!("{}|{}", namespace, owner_name);
+            let is_supported_parent = (owner_kind.eq_ignore_ascii_case("deployment")
+                && tracked_deployments.contains(&owner_set_key))
+                || (owner_kind.eq_ignore_ascii_case("statefulset")
+                    && tracked_statefulsets.contains(&owner_set_key))
+                || (owner_kind.eq_ignore_ascii_case("daemonset")
+                    && tracked_daemonsets.contains(&owner_set_key))
+                || (owner_kind.eq_ignore_ascii_case("job")
+                    && tracked_jobs.contains(&owner_set_key));
+            if !is_supported_parent {
+                continue;
+            }
+
+            let rs_key = node_key("ReplicaSet", &namespace, &name);
+            if nodes.contains_key(&rs_key) {
+                tracked_replicasets.insert(format!("{}|{}", namespace, name));
+                continue;
+            }
+
+            let detail = serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string());
+            nodes.insert(
+                rs_key.clone(),
+                ArgoTreeNode {
+                    kind: "ReplicaSet".to_string(),
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    sync: "Live".to_string(),
+                    health: rs_health(item),
+                    hook: "-".to_string(),
+                    wave: "-".to_string(),
+                    parent: Some(owner_key(&namespace, owner_kind, owner_name)),
+                    detail,
+                },
+            );
+            tracked_replicasets.insert(format!("{}|{}", namespace, name));
+        }
+
+        for item in items {
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if !kind.eq_ignore_ascii_case("pod") {
+                continue;
+            }
+            let name = item
+                .pointer("/metadata/name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let owner = item
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .and_then(|owners| owners.first())
+                .cloned();
+            let Some(owner) = owner else {
+                continue;
+            };
+            let owner_kind = owner.get("kind").and_then(Value::as_str).unwrap_or("");
+            let owner_name = owner.get("name").and_then(Value::as_str).unwrap_or("");
+            if owner_name.is_empty() || owner_kind.is_empty() {
+                continue;
+            }
+
+            let owner_set_key = format!("{}|{}", namespace, owner_name);
+            let parent = if owner_kind.eq_ignore_ascii_case("replicaset")
+                && tracked_replicasets.contains(&owner_set_key)
+            {
+                Some(owner_key(&namespace, "ReplicaSet", owner_name))
+            } else if owner_kind.eq_ignore_ascii_case("statefulset")
+                && tracked_statefulsets.contains(&owner_set_key)
+            {
+                Some(owner_key(&namespace, "StatefulSet", owner_name))
+            } else if owner_kind.eq_ignore_ascii_case("daemonset")
+                && tracked_daemonsets.contains(&owner_set_key)
+            {
+                Some(owner_key(&namespace, "DaemonSet", owner_name))
+            } else if owner_kind.eq_ignore_ascii_case("job")
+                && tracked_jobs.contains(&owner_set_key)
+            {
+                Some(owner_key(&namespace, "Job", owner_name))
+            } else {
+                None
+            };
+            let Some(parent) = parent else {
+                continue;
+            };
+
+            let pod_key = node_key("Pod", &namespace, &name);
+            if nodes.contains_key(&pod_key) {
+                continue;
+            }
+            let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+            nodes.insert(
+                pod_key,
+                ArgoTreeNode {
+                    kind: "Pod".to_string(),
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    sync: "Live".to_string(),
+                    health: pod_health(&item),
+                    hook: "-".to_string(),
+                    wave: "-".to_string(),
+                    parent: Some(parent),
+                    detail,
+                },
+            );
+        }
+    }
+
+    let mut children = HashMap::<String, Vec<String>>::new();
+    for (key, node) in &nodes {
+        if let Some(parent) = node.parent.as_ref() {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    for values in children.values_mut() {
+        values.sort_by(|left, right| {
+            let left_node = nodes.get(left);
+            let right_node = nodes.get(right);
+            match (left_node, right_node) {
+                (Some(left), Some(right)) => kind_rank(&left.kind)
+                    .cmp(&kind_rank(&right.kind))
+                    .then_with(|| left.name.cmp(&right.name)),
+                _ => left.cmp(right),
+            }
+        });
+    }
+
+    let mut rows = Vec::new();
+    let mut visited = HashSet::<String>::new();
+    root_keys.sort_by(|left, right| {
+        let left_node = nodes.get(left);
+        let right_node = nodes.get(right);
+        match (left_node, right_node) {
+            (Some(left), Some(right)) => kind_rank(&left.kind)
+                .cmp(&kind_rank(&right.kind))
+                .then_with(|| left.name.cmp(&right.name)),
+            _ => left.cmp(right),
+        }
+    });
+    root_keys.dedup();
+    for (index, root_key) in root_keys.iter().enumerate() {
+        render_tree_rows(
+            root_key,
+            &nodes,
+            &children,
+            &[],
+            index == root_keys.len().saturating_sub(1),
+            &mut rows,
+            &mut visited,
+        );
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Tree".to_string(),
+            "Namespace".to_string(),
+            "Name".to_string(),
+            "Sync".to_string(),
+            "Health".to_string(),
+            "Hook".to_string(),
+            "Wave".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+fn kubectl_resource_token_for_kind(kind: &str) -> String {
+    match kind.to_ascii_lowercase().as_str() {
+        "pod" => "pod".to_string(),
+        "deployment" => "deployment".to_string(),
+        "replicaset" => "replicaset".to_string(),
+        "statefulset" => "statefulset".to_string(),
+        "daemonset" => "daemonset".to_string(),
+        "job" => "job".to_string(),
+        "cronjob" => "cronjob".to_string(),
+        "service" => "service".to_string(),
+        "namespace" => "namespace".to_string(),
+        "node" => "node".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn supports_argocd_logs(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "pod" | "deployment" | "replicaset" | "statefulset" | "daemonset" | "job" | "cronjob"
+    )
+}
+
+async fn fetch_argocd_resource_panel(
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> std::result::Result<(String, String), String> {
+    let namespace = namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "-")
+        .map(str::to_string);
+    let token = kubectl_resource_token_for_kind(kind);
+
+    let mut get_json_args = vec!["get".to_string(), token.clone(), name.to_string()];
+    if let Some(namespace) = namespace.as_deref() {
+        get_json_args.push("-n".to_string());
+        get_json_args.push(namespace.to_string());
+    }
+    get_json_args.push("-o".to_string());
+    get_json_args.push("json".to_string());
+    let summary_json = run_external_json("kubectl", &get_json_args, 8).await;
+
+    let summary_block = match summary_json.as_ref() {
+        Ok(object) => {
+            let created = object
+                .pointer("/metadata/creationTimestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let object_namespace = object
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .or(namespace.as_deref())
+                .unwrap_or("-");
+            let labels = object
+                .pointer("/metadata/labels")
+                .and_then(Value::as_object)
+                .map(|labels| labels.len().to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let uid = object
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .unwrap_or("-");
+            let readiness = match kind.to_ascii_lowercase().as_str() {
+                "deployment" | "replicaset" | "statefulset" | "daemonset" => {
+                    let ready = object
+                        .pointer("/status/readyReplicas")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let replicas = object
+                        .pointer("/status/replicas")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    format!("{ready}/{replicas}")
+                }
+                "pod" => {
+                    let ready = object
+                        .pointer("/status/containerStatuses")
+                        .and_then(Value::as_array)
+                        .map(|statuses| {
+                            let total = statuses.len();
+                            let ready = statuses
+                                .iter()
+                                .filter(|entry| {
+                                    entry.get("ready").and_then(Value::as_bool).unwrap_or(false)
+                                })
+                                .count();
+                            format!("{ready}/{total}")
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    let phase = object
+                        .pointer("/status/phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("-");
+                    format!("{ready} ({phase})")
+                }
+                _ => "-".to_string(),
+            };
+            format!(
+                "kind: {kind}\nname: {name}\nnamespace: {object_namespace}\ncreated: {created}\nready: {readiness}\nlabels: {labels}\nuid: {uid}"
+            )
+        }
+        Err(error) => format!("Summary unavailable: {error}"),
+    };
+
+    let mut event_args = vec![
+        "get".to_string(),
+        "events".to_string(),
+        "--field-selector".to_string(),
+        format!("involvedObject.kind={kind},involvedObject.name={name}"),
+        "--sort-by=.lastTimestamp".to_string(),
+        "-o".to_string(),
+        "custom-columns=LAST:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message".to_string(),
+    ];
+    if let Some(namespace) = namespace.as_deref() {
+        event_args.insert(2, "-n".to_string());
+        event_args.insert(3, namespace.to_string());
+    }
+    let events_block = run_external_readonly("kubectl", &event_args, 8)
+        .await
+        .map(|output| bounded_output(&output, 40, 220))
+        .unwrap_or_else(|error| format!("Events unavailable: {error}"));
+
+    let logs_block = if supports_argocd_logs(kind) {
+        if let Some(namespace) = namespace.as_deref() {
+            let mut logs_args = vec![
+                "logs".to_string(),
+                format!("{}/{}", token, name),
+                "--all-containers=true".to_string(),
+                "--tail=80".to_string(),
+            ];
+            logs_args.push("-n".to_string());
+            logs_args.push(namespace.to_string());
+            run_external_readonly("kubectl", &logs_args, 10)
+                .await
+                .map(|output| bounded_output(&output, 80, 220))
+                .unwrap_or_else(|error| format!("Logs unavailable: {error}"))
+        } else {
+            "Logs unavailable: namespace is required".to_string()
+        }
+    } else {
+        "Logs unavailable for this kind".to_string()
+    };
+
+    let mut manifest_args = vec!["get".to_string(), token.clone(), name.to_string()];
+    if let Some(namespace) = namespace.as_deref() {
+        manifest_args.push("-n".to_string());
+        manifest_args.push(namespace.to_string());
+    }
+    manifest_args.push("-o".to_string());
+    manifest_args.push("yaml".to_string());
+    let manifest_block = run_external_readonly("kubectl", &manifest_args, 10)
+        .await
+        .map(|output| bounded_output(&output, 240, 220))
+        .unwrap_or_else(|error| format!("Manifest unavailable: {error}"));
+
+    let panel = format!(
+        "SUMMARY\n{summary_block}\n\nEVENTS\n{events_block}\n\nLOGS\n{logs_block}\n\nLIVE MANIFEST\n{manifest_block}"
+    );
+    let title = match namespace.as_deref() {
+        Some(namespace) => format!("Argo {kind} {namespace}/{name}"),
+        None => format!("Argo {kind} {name}"),
+    };
+    Ok((title, panel))
+}
+
+async fn fetch_argocd_projects_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "proj".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        12,
+    )
+    .await?;
+    let projects = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd proj list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in projects {
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let destinations = item
+            .pointer("/spec/destinations")
+            .and_then(Value::as_array)
+            .map(|items| items.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let repos = item
+            .pointer("/spec/sourceRepos")
+            .and_then(Value::as_array)
+            .map(|items| items.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let cluster_whitelist = item
+            .pointer("/spec/clusterResourceWhitelist")
+            .and_then(Value::as_array)
+            .map(|items| items.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let namespace_whitelist = item
+            .pointer("/spec/namespaceResourceWhitelist")
+            .and_then(Value::as_array)
+            .map(|items| items.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: name.clone(),
+            namespace: Some(namespace.clone()),
+            columns: vec![
+                name,
+                namespace,
+                destinations,
+                repos,
+                cluster_whitelist,
+                namespace_whitelist,
+            ],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Name".to_string(),
+            "Namespace".to_string(),
+            "Destinations".to_string(),
+            "Repos".to_string(),
+            "ClusterWL".to_string(),
+            "NamespaceWL".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_repos_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "repo".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        10,
+    )
+    .await?;
+    let repos = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd repo list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in repos {
+        let repo = item
+            .get("repo")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("url").and_then(Value::as_str))
+            .unwrap_or("-")
+            .to_string();
+        let typ = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let project = item
+            .get("project")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let insecure = item
+            .get("insecure")
+            .and_then(Value::as_bool)
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("no")
+            .to_string();
+        let oci = item
+            .get("enableOCI")
+            .and_then(Value::as_bool)
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("no")
+            .to_string();
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: short_repo_label(&repo),
+            namespace: None,
+            columns: vec![repo, typ, name, project, insecure, oci],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Repo".to_string(),
+            "Type".to_string(),
+            "Name".to_string(),
+            "Project".to_string(),
+            "Insecure".to_string(),
+            "OCI".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_clusters_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "cluster".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        12,
+    )
+    .await?;
+    let clusters = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd cluster list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in clusters {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let server = item
+            .get("server")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let status = item
+            .pointer("/connectionState/status")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                item.pointer("/info/connectionState/status")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("-")
+            .to_string();
+        let version = item
+            .get("serverVersion")
+            .and_then(Value::as_str)
+            .or_else(|| item.pointer("/info/serverVersion").and_then(Value::as_str))
+            .unwrap_or("-")
+            .to_string();
+        let applications = item
+            .pointer("/info/applicationsCount")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: name.clone(),
+            namespace: None,
+            columns: vec![name, server, status, version, applications],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Name".to_string(),
+            "Server".to_string(),
+            "Status".to_string(),
+            "Version".to_string(),
+            "Apps".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_accounts_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "account".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        10,
+    )
+    .await?;
+    let accounts = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd account list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in accounts {
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let enabled = item
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .map(|value| if value { "yes" } else { "no" })
+            .unwrap_or("-")
+            .to_string();
+        let capabilities = item
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|caps| {
+                caps.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: name.clone(),
+            namespace: None,
+            columns: vec![name, enabled, capabilities],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Name".to_string(),
+            "Enabled".to_string(),
+            "Capabilities".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_certs_table() -> std::result::Result<TableData, String> {
+    let mut certs = Vec::<Value>::new();
+    let mut errors = Vec::<String>::new();
+    for cert_type in ["https", "ssh"] {
+        let payload = run_external_json(
+            "argocd",
+            &[
+                "cert".to_string(),
+                "list".to_string(),
+                "--cert-type".to_string(),
+                cert_type.to_string(),
+                "-o".to_string(),
+                "json".to_string(),
+            ],
+            10,
+        )
+        .await;
+        match payload {
+            Ok(payload) => {
+                if let Some(entries) = payload.as_array() {
+                    certs.extend(entries.iter().cloned());
+                } else {
+                    errors.push(format!(
+                        "argocd cert list ({cert_type}) returned non-array JSON"
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!("argocd cert list ({cert_type}) failed: {error}")),
+        }
+    }
+
+    if certs.is_empty() && !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+
+    let mut rows = Vec::new();
+    for item in certs {
+        let server = item
+            .get("serverName")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let cert_type = item
+            .get("certType")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let sub_type = item
+            .get("certSubType")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let fingerprint = item
+            .get("certInfo")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: format!("{server}:{sub_type}"),
+            namespace: None,
+            columns: vec![server, cert_type, sub_type, fingerprint],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Server".to_string(),
+            "Type".to_string(),
+            "SubType".to_string(),
+            "Fingerprint".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+async fn fetch_argocd_gpg_table() -> std::result::Result<TableData, String> {
+    let payload = run_external_json(
+        "argocd",
+        &[
+            "gpg".to_string(),
+            "list".to_string(),
+            "-o".to_string(),
+            "json".to_string(),
+        ],
+        10,
+    )
+    .await?;
+    let keys = payload
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "argocd gpg list output is not an array".to_string())?;
+
+    let mut rows = Vec::new();
+    for item in keys {
+        let fingerprint = item
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
+        let key_id = item
+            .get("keyID")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("keyId").and_then(Value::as_str))
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .unwrap_or_else(|| {
+                if fingerprint.len() > 16 {
+                    &fingerprint[fingerprint.len() - 16..]
+                } else {
+                    "-"
+                }
+            })
+            .to_string();
+        let users = item
+            .get("uids")
+            .and_then(Value::as_array)
+            .map(|uids| {
+                uids.iter()
+                    .filter_map(|entry| {
+                        if let Some(value) = entry.as_str() {
+                            return Some(value.to_string());
+                        }
+                        if let Some(name) = entry.get("name").and_then(Value::as_str) {
+                            return Some(name.to_string());
+                        }
+                        entry.get("uid").and_then(Value::as_str).map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
+        rows.push(RowData {
+            name: key_id.clone(),
+            namespace: None,
+            columns: vec![key_id, fingerprint, users],
+            detail,
+        });
+    }
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "KeyID".to_string(),
+            "Fingerprint".to_string(),
+            "UIDs".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    Ok(table)
+}
+
+fn short_repo_label(repo: &str) -> String {
+    let trimmed = repo.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let parts = without_scheme.split('/').collect::<Vec<_>>();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        without_scheme.to_string()
     }
 }
 
