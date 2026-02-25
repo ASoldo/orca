@@ -1275,6 +1275,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 
 fn build_footer_glance_spans(app: &App) -> Vec<Span<'static>> {
     let metrics = app.overview_metrics();
+    let alerts = app.alert_snapshot();
     let selected_usage = app
         .selected_resource_usage()
         .filter(|(cpu, memory)| *cpu > 0 || *memory > 0);
@@ -1330,12 +1331,17 @@ fn build_footer_glance_spans(app: &App) -> Vec<Span<'static>> {
             Color::Rgb(59, 130, 246),
         ),
         (
-            format!(" 󰋊 {} ", metrics.sampled_pods),
+            format!(" 󰀦 {} ", alerts.warning_events),
             Color::White,
             Color::Rgb(79, 70, 229),
         ),
         (
-            format!(" 󰣇 {} ", metrics.sampled_nodes),
+            format!(" 󱎘 {} ", alerts.crash_loop_pods),
+            Color::White,
+            Color::Rgb(99, 102, 241),
+        ),
+        (
+            format!(" 󰒋 {} ", alerts.not_ready_nodes),
             Color::White,
             Color::Rgb(124, 58, 237),
         ),
@@ -1661,7 +1667,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     lines.push("Config: :config view runtime aliases/plugins (auto-reload)".to_string());
     lines.push("Safety: :readonly on|off|toggle (blocks mutating actions)".to_string());
     lines.push(
-        "Ops: :tools  :alerts  :argocd  :helm  :tf  :ansible  :docker  :rbac  :who-can  :oc  :kustomize  :plugin"
+        "Ops: :tools  :alerts  :argocd  :helm  :tf  :ansible  :docker  :rbac  :who-can  :oc  :kustomize  :git  :plugin"
             .to_string(),
     );
     lines.push("SRE: :pulses fleet snapshot  :xray selected-resource relations".to_string());

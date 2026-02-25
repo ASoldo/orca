@@ -322,6 +322,16 @@ pub struct OverviewMetrics {
     pub namespace_usage: HashMap<String, (u64, u64)>,
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct AlertSnapshot {
+    pub crash_loop_pods: usize,
+    pub pending_pods: usize,
+    pub failed_pods: usize,
+    pub restart_heavy_pods: usize,
+    pub warning_events: usize,
+    pub not_ready_nodes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::ResourceTab;

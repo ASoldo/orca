@@ -38,7 +38,9 @@ use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_syst
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, Read, Stdout, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command as TokioCommand;
@@ -969,6 +971,11 @@ async fn inspect_toolchain() -> String {
             args: &["--version"],
         },
         ToolProbe {
+            name: "git",
+            program: "git",
+            args: &["--version"],
+        },
+        ToolProbe {
             name: "kustomize",
             program: "kustomize",
             args: &["version"],
@@ -1000,6 +1007,10 @@ async fn inspect_toolchain() -> String {
 
     lines.push(String::new());
     lines.push("Use :ctx / :cluster / :usr for kube target catalogs.".to_string());
+    lines.push(
+        "Use :git/:repo to fetch repos, inspect files, export overrides, and kubectl apply."
+            .to_string(),
+    );
     lines.push(
         "Use :shell (pods), :logs, :scale, :restart, :port-forward from resource tables."
             .to_string(),
@@ -1336,7 +1347,460 @@ async fn inspect_ops_target(
                 ),
             }
         }
+        OpsInspectTarget::GitCatalog => {
+            let root = repo_cache_root();
+            let mut repos = discover_cached_repos(&root);
+            repos.sort();
+            repos.dedup();
+
+            let mut lines = vec![
+                format!("cache {}", root.display()),
+                String::new(),
+                "commands".to_string(),
+                "- :git fetch <url-or-repo> [ref]".to_string(),
+                "- :git files <url-or-repo> [path]".to_string(),
+                "- :git show <url-or-repo> <path>".to_string(),
+                "- :git export <url-or-repo> <source> [destination]".to_string(),
+                "- :git apply <url-or-repo> <path>".to_string(),
+                String::new(),
+                "cached repos".to_string(),
+            ];
+            if repos.is_empty() {
+                lines.push("-".to_string());
+            } else {
+                lines.extend(repos.into_iter().map(|repo| format!("- {repo}")));
+            }
+
+            (
+                "Git Repo Toolkit".to_string(),
+                lines.join("\n"),
+                "Git repo toolkit opened".to_string(),
+            )
+        }
+        OpsInspectTarget::GitFetch { repo, reference } => {
+            match ensure_repo_checkout(&repo, reference.as_deref()).await {
+                Ok(summary) => {
+                    let title = format!("Git Fetch {}", summary.slug);
+                    let mut lines = vec![
+                        format!("repo {}", summary.slug),
+                        format!("path {}", summary.path.display()),
+                        format!("status {}", summary.status),
+                    ];
+                    if let Some(reference) = summary.reference {
+                        lines.push(format!("ref {reference}"));
+                    }
+                    if !summary.output.is_empty() {
+                        lines.push(String::new());
+                        lines.push(bounded_output(&summary.output, 160, 220));
+                    }
+                    (
+                        title,
+                        lines.join("\n"),
+                        format!("Repository synced: {}", summary.slug),
+                    )
+                }
+                Err(error) => (
+                    "Git Fetch".to_string(),
+                    error.clone(),
+                    format!("Repository sync failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::GitFiles { repo, path } => {
+            match ensure_repo_checkout(&repo, None).await {
+                Ok(summary) => {
+                    let mut args = vec![
+                        "-C".to_string(),
+                        summary.path.display().to_string(),
+                        "ls-tree".to_string(),
+                        "-r".to_string(),
+                        "--name-only".to_string(),
+                        "HEAD".to_string(),
+                    ];
+                    if let Some(path) = path.as_ref() {
+                        args.push(path.clone());
+                    }
+                    match run_external_readonly("git", &args, 10).await {
+                        Ok(output) => {
+                            let list = bounded_output(&output, 260, 220);
+                            (
+                                format!("Git Files {}", summary.slug),
+                                format!(
+                                    "repo {}\npath {}\n\n{}",
+                                    summary.slug,
+                                    summary.path.display(),
+                                    list
+                                ),
+                                format!("Repo files listed: {}", summary.slug),
+                            )
+                        }
+                        Err(error) => (
+                            format!("Git Files {}", summary.slug),
+                            error.clone(),
+                            format!("Repo file listing failed: {error}"),
+                        ),
+                    }
+                }
+                Err(error) => (
+                    "Git Files".to_string(),
+                    error.clone(),
+                    format!("Repo file listing failed: {error}"),
+                ),
+            }
+        }
+        OpsInspectTarget::GitShow { repo, path } => match ensure_repo_checkout(&repo, None).await {
+            Ok(summary) => {
+                let spec = format!("HEAD:{path}");
+                let args = vec![
+                    "-C".to_string(),
+                    summary.path.display().to_string(),
+                    "--no-pager".to_string(),
+                    "show".to_string(),
+                    spec,
+                ];
+                match run_external_readonly("git", &args, 12).await {
+                    Ok(output) => (
+                        format!("Git Show {} {}", summary.slug, path),
+                        bounded_output(&output, 320, 220),
+                        format!("Repo file loaded: {path}"),
+                    ),
+                    Err(error) => (
+                        format!("Git Show {} {}", summary.slug, path),
+                        error.clone(),
+                        format!("Repo file load failed: {error}"),
+                    ),
+                }
+            }
+            Err(error) => (
+                "Git Show".to_string(),
+                error.clone(),
+                format!("Repo file load failed: {error}"),
+            ),
+        },
+        OpsInspectTarget::GitExport {
+            repo,
+            source,
+            destination,
+        } => match ensure_repo_checkout(&repo, None).await {
+            Ok(summary) => {
+                let source_path = summary.path.join(source.trim_start_matches('/'));
+                let destination_path = PathBuf::from(&destination);
+                match copy_repo_path(&source_path, &destination_path) {
+                    Ok(copied) => (
+                        format!("Git Export {}", summary.slug),
+                        [
+                            format!("repo {}", summary.slug),
+                            format!("from {}", source_path.display()),
+                            format!("to {}", destination_path.display()),
+                            format!("copied {}", copied),
+                        ]
+                        .join("\n"),
+                        format!("Repo content exported to {}", destination_path.display()),
+                    ),
+                    Err(error) => (
+                        format!("Git Export {}", summary.slug),
+                        error.clone(),
+                        format!("Repo export failed: {error}"),
+                    ),
+                }
+            }
+            Err(error) => (
+                "Git Export".to_string(),
+                error.clone(),
+                format!("Repo export failed: {error}"),
+            ),
+        },
+        OpsInspectTarget::GitApply { repo, path } => {
+            match ensure_repo_checkout(&repo, None).await {
+                Ok(summary) => {
+                    let manifest_path = summary.path.join(path.trim_start_matches('/'));
+                    if !manifest_path.exists() {
+                        let error =
+                            format!("manifest path does not exist: {}", manifest_path.display());
+                        (
+                            format!("Git Apply {}", summary.slug),
+                            error.clone(),
+                            format!("Repo apply failed: {error}"),
+                        )
+                    } else {
+                        let mut args = vec![
+                            "apply".to_string(),
+                            "-f".to_string(),
+                            manifest_path.display().to_string(),
+                        ];
+                        if let NamespaceScope::Named(namespace) = namespace_scope {
+                            args.push("-n".to_string());
+                            args.push(namespace.clone());
+                        }
+
+                        match run_external_readonly("kubectl", &args, 20).await {
+                            Ok(output) => (
+                                format!("Git Apply {}", summary.slug),
+                                bounded_output(&output, 240, 220),
+                                format!("Applied manifests from {}", manifest_path.display()),
+                            ),
+                            Err(error) => (
+                                format!("Git Apply {}", summary.slug),
+                                error.clone(),
+                                format!("Repo apply failed: {error}"),
+                            ),
+                        }
+                    }
+                }
+                Err(error) => (
+                    "Git Apply".to_string(),
+                    error.clone(),
+                    format!("Repo apply failed: {error}"),
+                ),
+            }
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct RepoCheckoutSummary {
+    slug: String,
+    path: PathBuf,
+    status: String,
+    reference: Option<String>,
+    output: String,
+}
+
+fn repo_cache_root() -> PathBuf {
+    if let Ok(path) = std::env::var("ORCA_REPO_CACHE")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(".manifests").join("repos")
+}
+
+fn discover_cached_repos(root: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() || !path.join(".git").exists() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>()
+}
+
+fn looks_like_repo_url(repo: &str) -> bool {
+    let repo = repo.trim();
+    repo.starts_with("http://")
+        || repo.starts_with("https://")
+        || repo.starts_with("ssh://")
+        || repo.starts_with("git@")
+        || repo.ends_with(".git")
+}
+
+fn repo_slug_from_locator(repo: &str) -> String {
+    let trimmed = repo.trim();
+    let segment = trimmed
+        .rsplit(['/', ':'])
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed)
+        .trim_end_matches(".git");
+    let mut slug = segment
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "repo".to_string()
+    } else {
+        slug
+    }
+}
+
+async fn ensure_repo_checkout(
+    repo: &str,
+    reference: Option<&str>,
+) -> std::result::Result<RepoCheckoutSummary, String> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Err("repository locator is empty".to_string());
+    }
+
+    let root = repo_cache_root();
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("failed to create repo cache {}: {error}", root.display()))?;
+
+    let is_url = looks_like_repo_url(repo);
+    let direct_path = PathBuf::from(repo);
+    let (slug, path) = if is_url {
+        let slug = repo_slug_from_locator(repo);
+        (slug.clone(), root.join(slug))
+    } else if direct_path.exists() {
+        let slug = direct_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(repo_slug_from_locator)
+            .unwrap_or_else(|| "repo".to_string());
+        (slug, direct_path)
+    } else {
+        let slug = repo_slug_from_locator(repo);
+        (slug.clone(), root.join(slug))
+    };
+
+    let git_dir = path.join(".git");
+    let (mut status, mut output_lines) = if is_url {
+        if git_dir.exists() {
+            let set_origin_args = vec![
+                "-C".to_string(),
+                path.display().to_string(),
+                "remote".to_string(),
+                "set-url".to_string(),
+                "origin".to_string(),
+                repo.to_string(),
+            ];
+            let _ = run_external_readonly("git", &set_origin_args, 6).await;
+            let fetch_args = vec![
+                "-C".to_string(),
+                path.display().to_string(),
+                "fetch".to_string(),
+                "--all".to_string(),
+                "--prune".to_string(),
+            ];
+            let output = run_external_readonly("git", &fetch_args, 15).await?;
+            let mut lines = Vec::new();
+            if !output.trim().is_empty() {
+                lines.push(output);
+            }
+            ("updated".to_string(), lines)
+        } else {
+            let clone_args = vec![
+                "clone".to_string(),
+                "--depth=1".to_string(),
+                repo.to_string(),
+                path.display().to_string(),
+            ];
+            let output = run_external_readonly("git", &clone_args, 30).await?;
+            let mut lines = Vec::new();
+            if !output.trim().is_empty() {
+                lines.push(output);
+            }
+            ("cloned".to_string(), lines)
+        }
+    } else if git_dir.exists() {
+        ("opened".to_string(), Vec::new())
+    } else {
+        return Err(format!(
+            "repo '{}' is not cached. Run :git fetch <url> first",
+            repo
+        ));
+    };
+
+    if let Some(reference) = reference {
+        let checkout_args = vec![
+            "-C".to_string(),
+            path.display().to_string(),
+            "checkout".to_string(),
+            reference.to_string(),
+        ];
+        match run_external_readonly("git", &checkout_args, 12).await {
+            Ok(output) => {
+                if !output.trim().is_empty() {
+                    output_lines.push(output);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        status = format!("{status} + ref");
+    }
+
+    let output = output_lines.join("\n");
+    Ok(RepoCheckoutSummary {
+        slug,
+        path,
+        status,
+        reference: reference.map(str::to_string),
+        output,
+    })
+}
+
+fn copy_repo_path(source: &Path, destination: &Path) -> std::result::Result<usize, String> {
+    if !source.exists() {
+        return Err(format!("source path does not exist: {}", source.display()));
+    }
+    if source.is_file() {
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create destination parent {}: {error}",
+                parent.display()
+            )
+        })?;
+        fs::copy(source, destination).map_err(|error| {
+            format!(
+                "failed to copy file {} -> {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        return Ok(1);
+    }
+
+    if !source.is_dir() {
+        return Err(format!(
+            "source path is not a file or directory: {}",
+            source.display()
+        ));
+    }
+
+    let mut copied = 0usize;
+    let mut stack = vec![(source.to_path_buf(), destination.to_path_buf())];
+    while let Some((src_dir, dst_dir)) = stack.pop() {
+        fs::create_dir_all(&dst_dir).map_err(|error| {
+            format!(
+                "failed to create destination directory {}: {error}",
+                dst_dir.display()
+            )
+        })?;
+        let entries = fs::read_dir(&src_dir)
+            .map_err(|error| format!("failed to read {}: {error}", src_dir.display()))?;
+        for entry in entries.flatten() {
+            let src_path = entry.path();
+            let dst_path = dst_dir.join(entry.file_name());
+            if src_path.is_dir() {
+                stack.push((src_path, dst_path));
+            } else if src_path.is_file() {
+                if let Some(parent) = dst_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        format!(
+                            "failed to create destination parent {}: {error}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                fs::copy(&src_path, &dst_path).map_err(|error| {
+                    format!(
+                        "failed to copy file {} -> {}: {error}",
+                        src_path.display(),
+                        dst_path.display()
+                    )
+                })?;
+                copied = copied.saturating_add(1);
+            }
+        }
+    }
+    Ok(copied)
 }
 
 async fn run_external_readonly(
@@ -1375,52 +1839,75 @@ async fn run_external_readonly(
 }
 
 async fn run_plugin_command(run: &PluginRun) -> Result<String> {
-    let mut cmd = TokioCommand::new(&run.program);
-    cmd.args(&run.args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let timeout_secs = run.timeout_secs.max(1);
+    let attempts = usize::from(run.retries).saturating_add(1);
+    let mut failures = Vec::new();
 
-    let output = timeout(Duration::from_secs(20), cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("plugin '{}' timed out after 20s", run.name))?
-        .with_context(|| format!("failed to run plugin '{}'", run.name))?;
+    for attempt in 1..=attempts {
+        let mut cmd = TokioCommand::new(&run.program);
+        cmd.args(&run.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let mut header = vec![
-        format!("plugin {}", run.name),
-        format!("command {}", run.program),
-        format!(
-            "args {}",
-            if run.args.is_empty() {
-                "(none)".to_string()
-            } else {
-                run.args.join(" ")
+        let output = timeout(Duration::from_secs(timeout_secs), cmd.output())
+            .await
+            .map_err(|_| format!("plugin '{}' timed out after {}s", run.name, timeout_secs))
+            .and_then(|result| {
+                result.map_err(|error| format!("failed to run plugin '{}': {error}", run.name))
+            });
+
+        let mut header = vec![
+            format!("plugin {}", run.name),
+            format!("command {}", run.program),
+            format!(
+                "args {}",
+                if run.args.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    run.args.join(" ")
+                }
+            ),
+            format!("mutating {}", run.mutating),
+            format!("profile timeout:{}s retries:{}", timeout_secs, run.retries),
+            format!("attempt {attempt}/{attempts}"),
+            String::new(),
+        ];
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let rendered = if stdout.is_empty() {
+                    format!("stderr\n{}", bounded_output(&stderr, 260, 220))
+                } else if stderr.is_empty() {
+                    format!("stdout\n{}", bounded_output(&stdout, 260, 220))
+                } else {
+                    format!(
+                        "stdout\n{}\n\nstderr\n{}",
+                        bounded_output(&stdout, 180, 220),
+                        bounded_output(&stderr, 80, 220)
+                    )
+                };
+                header.push(rendered);
+
+                if output.status.success() {
+                    return Ok(header.join("\n"));
+                }
+
+                let mut body = header.join("\n");
+                body.push_str(&format!("\n\nexit {}", output.status));
+                failures.push(body);
             }
-        ),
-        format!("mutating {}", run.mutating),
-        String::new(),
-    ];
-    let rendered = if stdout.is_empty() {
-        format!("stderr\n{}", bounded_output(&stderr, 260, 220))
-    } else if stderr.is_empty() {
-        format!("stdout\n{}", bounded_output(&stdout, 260, 220))
-    } else {
-        format!(
-            "stdout\n{}\n\nstderr\n{}",
-            bounded_output(&stdout, 180, 220),
-            bounded_output(&stderr, 80, 220)
-        )
-    };
-    header.push(rendered);
-
-    if output.status.success() {
-        Ok(header.join("\n"))
-    } else {
-        let mut body = header.join("\n");
-        body.push_str(&format!("\n\nexit {}", output.status));
-        Err(anyhow::anyhow!(body))
+            Err(error) => failures.push(error),
+        }
     }
+
+    Err(anyhow::anyhow!(
+        "plugin '{}' failed after {} attempt(s)\n\n{}",
+        run.name,
+        attempts,
+        failures.join("\n\n")
+    ))
 }
 
 fn bounded_output(input: &str, max_lines: usize, max_line_chars: usize) -> String {
@@ -1553,6 +2040,21 @@ async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
                             tab.title()
                         ));
                     }
+                }
+                match timeout(
+                    METRICS_REFRESH_TIMEOUT,
+                    gateway.fetch_alert_snapshot(&scope),
+                )
+                .await
+                {
+                    Ok(Ok(snapshot)) => app.set_alert_snapshot(snapshot),
+                    Ok(Err(error)) => {
+                        debug!(
+                            "alert snapshot refresh failed for {}: {error:#}",
+                            tab.title()
+                        )
+                    }
+                    Err(_) => debug!("alert snapshot refresh timed out for {}", tab.title()),
                 }
             }
         }

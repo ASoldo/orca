@@ -41,6 +41,14 @@ struct PluginSpec {
     description: String,
     #[serde(default)]
     mutating: bool,
+    #[serde(
+        default = "default_plugin_timeout_secs",
+        alias = "timeout",
+        alias = "timeout_s"
+    )]
+    timeout_secs: u64,
+    #[serde(default)]
+    retries: u8,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -90,6 +98,8 @@ impl RuntimeConfigWatcher {
                 args: plugin.args,
                 description: plugin.description,
                 mutating: plugin.mutating,
+                timeout_secs: plugin.timeout_secs,
+                retries: plugin.retries,
             })
             .collect::<Vec<_>>();
         let hotkeys = parsed
@@ -144,6 +154,10 @@ impl RuntimeConfigWatcher {
 
         Ok(None)
     }
+}
+
+fn default_plugin_timeout_secs() -> u64 {
+    20
 }
 
 fn discover_config_path() -> Option<PathBuf> {

@@ -27,7 +27,9 @@
 - Pod/service port-forward management with live PF indicators
 - YAML/JSON syntax highlighting in details view
 - DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
+- Git repo toolkit for fetching/caching repos and applying/exporting content (`:git`, `:repo`)
 - Fleet pulse snapshot (`:pulses`) and resource relationship trace (`:xray`)
+- Persistent incident snapshot counters in footer glance (warnings, crashloops, not-ready nodes)
 - Read-only safety mode (`:readonly on|off|toggle`, `ORCA_READONLY=1`)
 - Runtime aliases/plugins/hotkeys from YAML config with automatic reload
 
@@ -70,7 +72,7 @@
   - `:port-forward`
 - Optional but recommended: `metrics-server` for richer CPU/RAM dashboard data
 - Optional DevOps toolchain for overlays:
-  - `argocd`, `helm`, `terraform`, `ansible-playbook`, `docker`, `oc`, `kustomize`
+  - `argocd`, `helm`, `terraform`, `ansible-playbook`, `docker`, `oc`, `kustomize`, `git`
 
 `orca` uses `$KUBE_EDITOR` for `:edit`; if unset, it forwards `$EDITOR` to `kubectl`.
 Set `ORCA_READONLY=1` to start in safety mode where mutating actions are blocked.
@@ -182,6 +184,12 @@ Supported commands:
 - `:who-can <verb> <resource> [namespace]` (uses `kubectl-who-can` plugin or `kubectl who-can`)
 - `:oc` (`:openshift`)
 - `:kustomize [path]`
+- `:git` / `:repo` (toolkit catalog)
+- `:git fetch <url-or-repo> [ref]`
+- `:git files <url-or-repo> [path]`
+- `:git show <url-or-repo> <path>`
+- `:git export <url-or-repo> <source-path> [destination]`
+- `:git apply <url-or-repo> <path>`
 - `:plugin <name> [args...]` (`:plug`) runs configured plugin command
 
 Compatibility command:
@@ -191,7 +199,7 @@ Compatibility command:
 ## Jump mode (`>`)
 
 - Supports the same context/cluster/user and resource aliases for fast navigation
-- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>who-can`, `>oc`, `>kustomize`)
+- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>who-can`, `>oc`, `>kustomize`, `>git`)
 - Supports observability overlays (`>pulses`, `>xray`)
 - Supports incident overlays (`>alerts`)
 - Supports config/plugin actions (`>config`, `>plugin <name> ...`)
@@ -240,6 +248,8 @@ plugins:
     args: ["describe", "pod", "{name}", "-n", "{namespace}"]
     description: "Describe currently selected pod"
     mutating: false
+    timeout_secs: 20
+    retries: 1
 
 hotkeys:
   - key: "ctrl+shift+p"
@@ -259,6 +269,10 @@ Supported placeholders in plugin args:
 - `{context}`, `{cluster}`, `{user}`, `{scope}`
 - `{all_namespaces}`, `{args}`
 - `{extra}` to splice all user-supplied plugin args
+
+Plugin runtime profile fields:
+- `timeout_secs`: command timeout per attempt (clamped `1..300`, default `20`)
+- `retries`: retry count after the first failed attempt (clamped `0..5`, default `0`)
 
 ## Project layout
 

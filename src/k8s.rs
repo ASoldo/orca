@@ -20,8 +20,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::model::{
-    ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
-    ResourceTab, RowData, TableData,
+    AlertSnapshot, ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics,
+    PodContainerInfo, ResourceTab, RowData, TableData,
 };
 
 #[derive(Clone)]
@@ -2757,6 +2757,7 @@ impl KubeGateway {
     }
 
     pub async fn fetch_alerts_report(&self, scope: &NamespaceScope) -> Result<String> {
+        let snapshot = self.fetch_alert_snapshot(scope).await?;
         let pods_api: Api<Pod> = match scope {
             NamespaceScope::All => Api::all(self.client.clone()),
             NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
@@ -2901,12 +2902,12 @@ impl KubeGateway {
             format!("󰀦 Alerts scope:{scope_label}"),
             format!(
                 "summary crashloop:{} pending:{} failed:{} restarts>=5:{} warning-events:{} not-ready-nodes:{}",
-                crash_loop_pods.len(),
-                pending_pods.len(),
-                failed_pods.len(),
-                restart_heavy_pods.len(),
-                warning_events.len(),
-                not_ready_nodes.len()
+                snapshot.crash_loop_pods,
+                snapshot.pending_pods,
+                snapshot.failed_pods,
+                snapshot.restart_heavy_pods,
+                snapshot.warning_events,
+                snapshot.not_ready_nodes
             ),
             String::new(),
             "crashloop pods".to_string(),
@@ -2953,6 +2954,97 @@ impl KubeGateway {
         }
 
         Ok(lines.join("\n"))
+    }
+
+    pub async fn fetch_alert_snapshot(&self, scope: &NamespaceScope) -> Result<AlertSnapshot> {
+        let pods_api: Api<Pod> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let pods = pods_api.list(&list_params()).await?;
+
+        let mut crash_loop_pods = 0usize;
+        let mut pending_pods = 0usize;
+        let mut failed_pods = 0usize;
+        let mut restart_heavy_pods = 0usize;
+        for pod in &pods.items {
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.phase.as_deref())
+                .unwrap_or("Unknown");
+
+            if phase == "Pending" {
+                pending_pods = pending_pods.saturating_add(1);
+            }
+            if phase == "Failed" {
+                failed_pods = failed_pods.saturating_add(1);
+            }
+
+            let (_, _, restarts) = pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
+            if restarts >= 5 {
+                restart_heavy_pods = restart_heavy_pods.saturating_add(1);
+            }
+
+            let has_crash_loop = pod.status.as_ref().is_some_and(|status| {
+                status.container_statuses.as_ref().is_some_and(|statuses| {
+                    statuses.iter().any(|container| {
+                        container
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.waiting.as_ref())
+                            .and_then(|waiting| waiting.reason.as_deref())
+                            .is_some_and(|reason| reason.eq_ignore_ascii_case("CrashLoopBackOff"))
+                    })
+                })
+            });
+            if has_crash_loop {
+                crash_loop_pods = crash_loop_pods.saturating_add(1);
+            }
+        }
+
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let nodes = nodes.list(&list_params()).await?;
+        let not_ready_nodes = nodes
+            .items
+            .iter()
+            .filter(|node| {
+                node.status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_ref())
+                    .and_then(|conditions| {
+                        conditions
+                            .iter()
+                            .find(|condition| condition.type_ == "Ready")
+                    })
+                    .is_some_and(|condition| condition.status != "True")
+            })
+            .count();
+
+        let events_api: Api<Event> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let events = events_api.list(&list_params()).await?;
+        let warning_events = events
+            .items
+            .iter()
+            .filter(|event| {
+                event
+                    .type_
+                    .as_deref()
+                    .is_some_and(|event_type| event_type.eq_ignore_ascii_case("Warning"))
+            })
+            .count();
+
+        Ok(AlertSnapshot {
+            crash_loop_pods,
+            pending_pods,
+            failed_pods,
+            restart_heavy_pods,
+            warning_events,
+            not_ready_nodes,
+        })
     }
 
     pub async fn fetch_xray_report(

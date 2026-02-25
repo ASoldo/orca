@@ -1,10 +1,11 @@
 use crate::input::{Action, normalize_hotkey_spec};
 use crate::model::{
-    ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
-    ResourceTab, RowData, TableData,
+    AlertSnapshot, ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics,
+    PodContainerInfo, ResourceTab, RowData, TableData,
 };
 use chrono::Local;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InputMode {
@@ -59,6 +60,28 @@ pub enum OpsInspectTarget {
         resource: String,
         namespace: Option<String>,
     },
+    GitCatalog,
+    GitFetch {
+        repo: String,
+        reference: Option<String>,
+    },
+    GitFiles {
+        repo: String,
+        path: Option<String>,
+    },
+    GitShow {
+        repo: String,
+        path: String,
+    },
+    GitExport {
+        repo: String,
+        source: String,
+        destination: String,
+    },
+    GitApply {
+        repo: String,
+        path: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +91,8 @@ pub struct PluginCommandDef {
     pub args: Vec<String>,
     pub description: String,
     pub mutating: bool,
+    pub timeout_secs: u64,
+    pub retries: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +101,8 @@ pub struct PluginRun {
     pub program: String,
     pub args: Vec<String>,
     pub mutating: bool,
+    pub timeout_secs: u64,
+    pub retries: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +262,7 @@ struct ViewState {
     detail_overlay_title: Option<String>,
     detail_scroll: u16,
     container_picker: Option<ContainerPickerState>,
+    alert_snapshot: AlertSnapshot,
     flow_stack: Vec<FlowState>,
     selected_indices: HashMap<ResourceTab, usize>,
 }
@@ -286,6 +314,7 @@ pub struct App {
     config_source: Option<String>,
     active_port_forwards: Vec<PortForwardSession>,
     overview_metrics: OverviewMetrics,
+    alert_snapshot: AlertSnapshot,
     flow_stack: Vec<FlowState>,
     active_view_slot: usize,
     view_slots: Vec<Option<ViewState>>,
@@ -323,6 +352,7 @@ impl App {
             detail_overlay_title: None,
             detail_scroll: 0,
             container_picker: None,
+            alert_snapshot: AlertSnapshot::default(),
             flow_stack: Vec::new(),
             selected_indices: initial_selected_indices,
         });
@@ -374,6 +404,7 @@ impl App {
             config_source: None,
             active_port_forwards: Vec::new(),
             overview_metrics: OverviewMetrics::default(),
+            alert_snapshot: AlertSnapshot::default(),
             flow_stack: Vec::new(),
             active_view_slot: initial_slot,
             view_slots,
@@ -476,6 +507,8 @@ impl App {
             plugin.name = plugin.name.trim().to_ascii_lowercase();
             plugin.command = plugin.command.trim().to_string();
             plugin.description = plugin.description.trim().to_string();
+            plugin.timeout_secs = plugin.timeout_secs.clamp(1, 300);
+            plugin.retries = plugin.retries.min(5);
         }
         plugins.retain(|plugin| !plugin.name.is_empty() && !plugin.command.is_empty());
         plugins.sort_by(|left, right| left.name.cmp(&right.name));
@@ -743,6 +776,10 @@ impl App {
 
     pub fn overview_metrics(&self) -> &OverviewMetrics {
         &self.overview_metrics
+    }
+
+    pub fn alert_snapshot(&self) -> &AlertSnapshot {
+        &self.alert_snapshot
     }
 
     pub fn selected_resource_usage(&self) -> Option<(u64, u64)> {
@@ -1036,6 +1073,10 @@ impl App {
 
     pub fn set_overview_metrics(&mut self, metrics: OverviewMetrics) {
         self.overview_metrics = metrics;
+    }
+
+    pub fn set_alert_snapshot(&mut self, snapshot: AlertSnapshot) {
+        self.alert_snapshot = snapshot;
     }
 
     pub fn set_table_page_size(&mut self, rows: usize) {
@@ -1603,6 +1644,7 @@ impl App {
             detail_overlay_title: self.detail_overlay_title.clone(),
             detail_scroll: self.detail_scroll,
             container_picker: self.container_picker.clone(),
+            alert_snapshot: self.alert_snapshot.clone(),
             flow_stack: self.flow_stack.clone(),
             selected_indices,
         }
@@ -1627,6 +1669,7 @@ impl App {
         self.detail_overlay_title = state.detail_overlay_title.clone();
         self.detail_scroll = state.detail_scroll;
         self.container_picker = state.container_picker.clone();
+        self.alert_snapshot = state.alert_snapshot.clone();
         self.flow_stack = state.flow_stack.clone();
 
         let tabs = self.tabs.clone();
@@ -1820,6 +1863,15 @@ impl App {
             "kustomize .".to_string(),
             "plugin".to_string(),
             "plugin ".to_string(),
+            "git".to_string(),
+            "git ".to_string(),
+            "git fetch ".to_string(),
+            "git files ".to_string(),
+            "git show ".to_string(),
+            "git export ".to_string(),
+            "git apply ".to_string(),
+            "repo".to_string(),
+            "repo ".to_string(),
             "refresh".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
@@ -1920,6 +1972,8 @@ impl App {
             "oc".to_string(),
             "kustomize .".to_string(),
             "plugin".to_string(),
+            "git".to_string(),
+            "repo".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
             "cl ".to_string(),
@@ -2354,6 +2408,10 @@ impl App {
                     target: OpsInspectTarget::KustomizeBuild { path },
                 }
             }
+            "git" | "repo" => {
+                let args = parts.map(str::to_string).collect::<Vec<_>>();
+                self.prepare_git_command(args)
+            }
             "plugin" | "plug" => {
                 let name = parts.next().map(str::to_ascii_lowercase);
                 let extra = parts.map(str::to_string).collect::<Vec<_>>();
@@ -2631,6 +2689,11 @@ impl App {
             };
         }
 
+        if matches!(first.as_str(), "git" | "repo") {
+            let args = parts.map(str::to_string).collect::<Vec<_>>();
+            return self.prepare_git_command(args);
+        }
+
         if matches!(first.as_str(), "plugin" | "plug") {
             let name = parts.next().map(str::to_ascii_lowercase);
             let extra = parts.map(str::to_string).collect::<Vec<_>>();
@@ -2905,8 +2968,13 @@ impl App {
                     table_cell(&plugin.description, 72)
                 };
                 lines.push(format!(
-                    "- {} [{}] {} ({})",
-                    plugin.name, mutate, plugin.command, description
+                    "- {} [{}] {} timeout:{}s retries:{} ({})",
+                    plugin.name,
+                    mutate,
+                    plugin.command,
+                    plugin.timeout_secs,
+                    plugin.retries,
+                    description
                 ));
             }
         }
@@ -2977,7 +3045,131 @@ impl App {
                 program: plugin.command,
                 args,
                 mutating: plugin.mutating,
+                timeout_secs: plugin.timeout_secs,
+                retries: plugin.retries,
             },
+        }
+    }
+
+    fn prepare_git_command(&mut self, args: Vec<String>) -> AppCommand {
+        if args.is_empty() {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::GitCatalog,
+            };
+        }
+
+        let first = args[0].trim().to_string();
+        if looks_like_repo_locator(&first) {
+            let reference = args.get(1).cloned();
+            self.status = format!("Syncing repository '{}'", first);
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::GitFetch {
+                    repo: first,
+                    reference,
+                },
+            };
+        }
+
+        match resolve_command_token(&first).as_str() {
+            "help" | "?" | "ls" | "list" => AppCommand::InspectOps {
+                target: OpsInspectTarget::GitCatalog,
+            },
+            "fetch" | "clone" | "pull" => {
+                let Some(repo) = args.get(1).cloned() else {
+                    self.status = "Usage: :git fetch <url-or-repo> [ref]".to_string();
+                    return AppCommand::None;
+                };
+                let reference = args.get(2).cloned();
+                self.status = format!("Syncing repository '{}'", repo);
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::GitFetch { repo, reference },
+                }
+            }
+            "files" => {
+                let Some(repo) = args.get(1).cloned() else {
+                    self.status = "Usage: :git files <url-or-repo> [path]".to_string();
+                    return AppCommand::None;
+                };
+                let path = args.get(2).cloned();
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::GitFiles { repo, path },
+                }
+            }
+            "show" | "cat" => {
+                let Some(repo) = args.get(1).cloned() else {
+                    self.status = "Usage: :git show <url-or-repo> <path>".to_string();
+                    return AppCommand::None;
+                };
+                let Some(path) = args.get(2).cloned() else {
+                    self.status = "Usage: :git show <url-or-repo> <path>".to_string();
+                    return AppCommand::None;
+                };
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::GitShow { repo, path },
+                }
+            }
+            "export" | "cp" | "copy" => {
+                if !self.ensure_write_allowed("git export") {
+                    return AppCommand::None;
+                }
+                let Some(repo) = args.get(1).cloned() else {
+                    self.status =
+                        "Usage: :git export <url-or-repo> <source-path> [destination]".to_string();
+                    return AppCommand::None;
+                };
+                let Some(source) = args.get(2).cloned() else {
+                    self.status =
+                        "Usage: :git export <url-or-repo> <source-path> [destination]".to_string();
+                    return AppCommand::None;
+                };
+                let destination = args.get(3).cloned().unwrap_or_else(|| {
+                    Path::new(&source)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("repo-export")
+                        .to_string()
+                });
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::GitExport {
+                        repo,
+                        source,
+                        destination,
+                    },
+                }
+            }
+            "apply" => {
+                if !self.ensure_write_allowed("git apply") {
+                    return AppCommand::None;
+                }
+                let Some(repo) = args.get(1).cloned() else {
+                    self.status = "Usage: :git apply <url-or-repo> <path>".to_string();
+                    return AppCommand::None;
+                };
+                let Some(path) = args.get(2).cloned() else {
+                    self.status = "Usage: :git apply <url-or-repo> <path>".to_string();
+                    return AppCommand::None;
+                };
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::GitApply { repo, path },
+                }
+            }
+            _ => {
+                if args.len() == 1 {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::GitFiles {
+                            repo: first,
+                            path: None,
+                        },
+                    }
+                } else {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::GitShow {
+                            repo: first,
+                            path: args[1].clone(),
+                        },
+                    }
+                }
+            }
         }
     }
 
@@ -3738,6 +3930,8 @@ fn is_known_command_token(token: &str) -> bool {
             | "openshift"
             | "kustomize"
             | "kustom"
+            | "git"
+            | "repo"
             | "plugin"
             | "plug"
             | "refresh"
@@ -3845,6 +4039,18 @@ fn parse_shell_args(args: Vec<String>) -> (Option<String>, String) {
         }
         [container, shell, ..] => (Some(container.clone()), normalize_shell_token(shell)),
     }
+}
+
+fn looks_like_repo_locator(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ssh://")
+        || trimmed.starts_with("git@")
+        || trimmed.ends_with(".git")
 }
 
 fn is_shell_token(token: &str) -> bool {
@@ -3983,6 +4189,53 @@ mod tests {
 
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::InspectTooling);
+    }
+
+    #[test]
+    fn git_command_without_args_opens_catalog() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "git".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::GitCatalog
+            }
+        );
+    }
+
+    #[test]
+    fn git_fetch_url_builds_target() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "git fetch https://github.com/example/app.git main".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::GitFetch {
+                    repo: "https://github.com/example/app.git".to_string(),
+                    reference: Some("main".to_string()),
+                }
+            }
+        );
     }
 
     #[test]
@@ -4255,6 +4508,8 @@ mod tests {
             ],
             description: "diag".to_string(),
             mutating: false,
+            timeout_secs: 15,
+            retries: 2,
         };
         app.set_runtime_config(
             HashMap::new(),
@@ -4283,7 +4538,9 @@ mod tests {
                         "-o".to_string(),
                         "yaml".to_string()
                     ],
-                    mutating: false
+                    mutating: false,
+                    timeout_secs: 15,
+                    retries: 2
                 }
             }
         );
