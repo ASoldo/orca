@@ -1136,7 +1136,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Color::White
         };
         let status_icon = footer_status_icon(&status_text);
-        push_powerline_segment(&mut spans, " 󰘳 nrm ", Color::White, PL_A, status_bg);
+        let mode_bg = if app.read_only() { WARN } else { PL_A };
+        let mode_fg = if app.read_only() {
+            Color::Black
+        } else {
+            Color::White
+        };
+        let mode_label = if app.read_only() {
+            " 󰌾 ro "
+        } else {
+            " 󰘳 nrm "
+        };
+        push_powerline_segment(&mut spans, mode_label, mode_fg, mode_bg, status_bg);
         push_powerline_segment(
             &mut spans,
             format!(" {status_icon} {} ", compact_text(&status_text, 40)),
@@ -1646,6 +1657,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
         "Catalog: :ctx list/switch  :cluster list/switch  :usr list/switch  :ns list/scope"
             .to_string(),
     );
+    lines.push("Safety: :readonly on|off|toggle (blocks mutating actions)".to_string());
     lines.push(
         "Ops: :tools  :argocd  :helm  :tf  :ansible  :docker  :rbac  :oc  :kustomize".to_string(),
     );

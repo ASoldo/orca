@@ -28,6 +28,7 @@
 - YAML/JSON syntax highlighting in details view
 - DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
 - Fleet pulse snapshot (`:pulses`) and resource relationship trace (`:xray`)
+- Read-only safety mode (`:readonly on|off|toggle`, `ORCA_READONLY=1`)
 
 ## Supported resources
 
@@ -71,6 +72,7 @@
   - `argocd`, `helm`, `terraform`, `ansible-playbook`, `docker`, `oc`, `kustomize`
 
 `orca` uses `$KUBE_EDITOR` for `:edit`; if unset, it forwards `$EDITOR` to `kubectl`.
+Set `ORCA_READONLY=1` to start in safety mode where mutating actions are blocked.
 
 ## Run
 
@@ -164,6 +166,7 @@ Supported commands:
 - `:crd-refresh`
 - `:help`
 - `:ops`, `:tools`
+- `:readonly on|off|toggle` (`:ro`)
 - `:pulses` (`:pulse`)
 - `:xray` (`:xr`, `:x`) on selected row (or explicit target)
 - `:argocd [app-name]`

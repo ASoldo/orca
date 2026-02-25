@@ -209,6 +209,7 @@ pub struct App {
     filter: String,
     input: String,
     status: String,
+    read_only: bool,
     show_help: bool,
     pending_g: bool,
     completion_index: usize,
@@ -292,6 +293,7 @@ impl App {
             filter: String::new(),
             input: String::new(),
             status: "Ready".to_string(),
+            read_only: false,
             show_help: false,
             pending_g: false,
             completion_index: 0,
@@ -418,6 +420,19 @@ impl App {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
+        self.status = if read_only {
+            "Read-only mode enabled".to_string()
+        } else {
+            "Read-only mode disabled".to_string()
+        };
     }
 
     pub fn show_help(&self) -> bool {
@@ -1642,6 +1657,9 @@ impl App {
     fn command_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "help".to_string(),
+            "readonly".to_string(),
+            "readonly on".to_string(),
+            "readonly off".to_string(),
             "ops".to_string(),
             "tools".to_string(),
             "pulses".to_string(),
@@ -1735,6 +1753,7 @@ impl App {
     fn jump_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "ops".to_string(),
+            "readonly".to_string(),
             "tools".to_string(),
             "pulses".to_string(),
             "xray".to_string(),
@@ -2061,6 +2080,10 @@ impl App {
                 self.status = "Exit requested".to_string();
                 AppCommand::None
             }
+            "readonly" | "ro" => {
+                self.handle_read_only_command(parts.next());
+                AppCommand::None
+            }
             "ops" => AppCommand::InspectTooling,
             "tools" => AppCommand::InspectTooling,
             "pulses" | "pulse" => AppCommand::InspectPulses,
@@ -2272,6 +2295,11 @@ impl App {
         let first = resolve_command_token(parts.next().unwrap_or_default());
         if first == "ops" {
             return AppCommand::InspectTooling;
+        }
+
+        if matches!(first.as_str(), "readonly" | "ro") {
+            self.handle_read_only_command(parts.next());
+            return AppCommand::None;
         }
 
         if first == "tools" {
@@ -2636,7 +2664,52 @@ impl App {
         self.switch_to_tab(ResourceTab::CustomResources)
     }
 
+    fn handle_read_only_command(&mut self, value: Option<&str>) {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None => {
+                self.status = format!(
+                    "Read-only mode is {} (use :readonly on|off|toggle)",
+                    if self.read_only { "ON" } else { "OFF" }
+                );
+            }
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" | "enable" | "enabled" => {
+                    self.read_only = true;
+                    self.status = "Read-only mode enabled".to_string();
+                }
+                "off" | "false" | "0" | "disable" | "disabled" => {
+                    self.read_only = false;
+                    self.status = "Read-only mode disabled".to_string();
+                }
+                "toggle" | "flip" => {
+                    self.read_only = !self.read_only;
+                    self.status = if self.read_only {
+                        "Read-only mode enabled".to_string()
+                    } else {
+                        "Read-only mode disabled".to_string()
+                    };
+                }
+                _ => {
+                    self.status = "Usage: :readonly on|off|toggle".to_string();
+                }
+            },
+        }
+    }
+
+    fn ensure_write_allowed(&mut self, action: &str) -> bool {
+        if self.read_only {
+            self.status = format!("Read-only mode ON: '{action}' is blocked");
+            false
+        } else {
+            true
+        }
+    }
+
     fn prepare_delete_confirmation(&mut self) -> AppCommand {
+        if !self.ensure_write_allowed("delete") {
+            return AppCommand::None;
+        }
+
         let tab = self.active_tab();
         if matches!(tab, ResourceTab::Events | ResourceTab::CustomResources) {
             self.status = format!("Delete is not supported for {}", tab.title());
@@ -2677,6 +2750,10 @@ impl App {
     }
 
     fn prepare_restart_confirmation(&mut self) -> AppCommand {
+        if !self.ensure_write_allowed("restart") {
+            return AppCommand::None;
+        }
+
         let tab = self.active_tab();
         if !matches!(tab, ResourceTab::Deployments | ResourceTab::StatefulSets) {
             self.status = "Restart is available only for Deployments and StatefulSets".to_string();
@@ -2707,6 +2784,10 @@ impl App {
     }
 
     fn prepare_scale_command(&mut self, replicas: i32) -> AppCommand {
+        if !self.ensure_write_allowed("scale") {
+            return AppCommand::None;
+        }
+
         if replicas < 0 {
             self.status = "Replicas must be >= 0".to_string();
             return AppCommand::None;
@@ -2744,6 +2825,10 @@ impl App {
     }
 
     fn prepare_exec_command(&mut self, command: Vec<String>) -> AppCommand {
+        if !self.ensure_write_allowed("exec") {
+            return AppCommand::None;
+        }
+
         if self.active_tab() != ResourceTab::Pods {
             self.status = "Exec is only available in the Pods tab".to_string();
             return AppCommand::None;
@@ -2772,6 +2857,10 @@ impl App {
     }
 
     fn prepare_shell_command(&mut self, container: Option<String>, shell: String) -> AppCommand {
+        if !self.ensure_write_allowed("shell") {
+            return AppCommand::None;
+        }
+
         if self.active_tab() != ResourceTab::Pods {
             self.status = "Shell access is only available from the Pods tab".to_string();
             return AppCommand::None;
@@ -2801,6 +2890,10 @@ impl App {
     }
 
     fn prepare_edit_command(&mut self) -> AppCommand {
+        if !self.ensure_write_allowed("edit") {
+            return AppCommand::None;
+        }
+
         let tab = self.active_tab();
         let Some((resource, namespaced)) = self.kubectl_resource_for_tab(tab) else {
             self.status = format!("Edit is not supported for {}", tab.title());
@@ -2950,6 +3043,10 @@ impl App {
     }
 
     fn prepare_port_forward(&mut self, local_port: u16, remote_port: u16) -> AppCommand {
+        if !self.ensure_write_allowed("port-forward") {
+            return AppCommand::None;
+        }
+
         let tab = self.active_tab();
         if !matches!(tab, ResourceTab::Pods | ResourceTab::Services) {
             self.status = "Port-forward is available in Pods and Services tabs".to_string();
@@ -3205,6 +3302,8 @@ fn is_known_command_token(token: &str) -> bool {
         token,
         "q" | "quit"
             | "exit"
+            | "readonly"
+            | "ro"
             | "ops"
             | "pulses"
             | "pulse"
@@ -3586,6 +3685,56 @@ mod tests {
                 name: "api-123".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn readonly_command_enables_read_only_mode() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "readonly on".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.read_only());
+    }
+
+    #[test]
+    fn readonly_mode_blocks_scale_command() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_read_only(true);
+
+        let now = Local::now();
+        let mut deployments = TableData::default();
+        deployments.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "api".to_string(),
+                namespace: Some("orca-sandbox".to_string()),
+                columns: vec!["api".to_string()],
+                detail: "kind: Deployment".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Deployments, deployments);
+        let _ = app.switch_to_tab(ResourceTab::Deployments);
+
+        app.apply_action(Action::StartCommand);
+        for c in "scale 3".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.status().contains("Read-only mode ON"));
     }
 
     #[test]

@@ -93,6 +93,12 @@ async fn main() -> Result<()> {
         gateway.context().to_string(),
         namespace_scope,
     );
+    if std::env::var("ORCA_READONLY")
+        .map(|value| parse_truthy_env(&value))
+        .unwrap_or(false)
+    {
+        app.set_read_only(true);
+    }
     app.set_user(gateway.user().to_string());
     app.set_kube_catalog(
         gateway.available_contexts(),
@@ -131,6 +137,13 @@ fn resolve_namespace_scope(args: &CliArgs, gateway: &KubeGateway) -> NamespaceSc
     } else {
         NamespaceScope::Named(gateway.default_namespace().to_string())
     }
+}
+
+fn parse_truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled" | "enable"
+    )
 }
 
 async fn run(app: &mut App, gateway: &mut KubeGateway, refresh_ms: u64) -> Result<()> {
