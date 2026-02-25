@@ -169,7 +169,8 @@ Supported commands:
 - `:help`
 - `:ops`, `:tools`
 - `:readonly on|off|toggle` (`:ro`)
-- `:config` (shows loaded config source, aliases, plugins)
+- `:config` (shows loaded config source, aliases, plugins, hotkeys)
+- `:alerts` (`:alert`) high-signal incident snapshot
 - `:pulses` (`:pulse`)
 - `:xray` (`:xr`, `:x`) on selected row (or explicit target)
 - `:argocd [app-name]`
@@ -191,6 +192,7 @@ Compatibility command:
 - Supports the same context/cluster/user and resource aliases for fast navigation
 - Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>oc`, `>kustomize`)
 - Supports observability overlays (`>pulses`, `>xray`)
+- Supports incident overlays (`>alerts`)
 - Supports config/plugin actions (`>config`, `>plugin <name> ...`)
 - Supports namespaced targets (for example `>po my-ns/my-pod`)
 - Supports fuzzy jump by resource name/namespace when no explicit alias is provided

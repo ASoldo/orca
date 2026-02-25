@@ -2756,6 +2756,205 @@ impl KubeGateway {
         .join("\n"))
     }
 
+    pub async fn fetch_alerts_report(&self, scope: &NamespaceScope) -> Result<String> {
+        let pods_api: Api<Pod> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let pods = pods_api.list(&list_params()).await?;
+
+        let mut crash_loop_pods = Vec::new();
+        let mut pending_pods = Vec::new();
+        let mut failed_pods = Vec::new();
+        let mut restart_heavy_pods = Vec::new();
+        for pod in &pods.items {
+            let namespace = pod.namespace().unwrap_or_else(|| "-".to_string());
+            let pod_name = pod.name_any();
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.phase.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let (ready, total, restarts) =
+                pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
+
+            if phase == "Pending" {
+                pending_pods.push(format!("- {namespace}/{pod_name} ready:{ready}/{total}"));
+            }
+            if phase == "Failed" {
+                failed_pods.push(format!("- {namespace}/{pod_name} ready:{ready}/{total}"));
+            }
+            if restarts >= 5 {
+                restart_heavy_pods.push(format!(
+                    "- {namespace}/{pod_name} restarts:{restarts} phase:{phase}"
+                ));
+            }
+
+            let has_crash_loop = pod.status.as_ref().is_some_and(|status| {
+                status.container_statuses.as_ref().is_some_and(|statuses| {
+                    statuses.iter().any(|container| {
+                        container
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.waiting.as_ref())
+                            .and_then(|waiting| waiting.reason.as_deref())
+                            .is_some_and(|reason| reason.eq_ignore_ascii_case("CrashLoopBackOff"))
+                    })
+                })
+            });
+            if has_crash_loop {
+                crash_loop_pods.push(format!(
+                    "- {namespace}/{pod_name} restarts:{restarts} phase:{phase}"
+                ));
+            }
+        }
+
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let nodes = nodes.list(&list_params()).await?;
+        let mut not_ready_nodes = nodes
+            .items
+            .iter()
+            .filter_map(|node| {
+                let ready_condition = node
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_ref())
+                    .and_then(|conditions| {
+                        conditions
+                            .iter()
+                            .find(|condition| condition.type_ == "Ready")
+                    });
+                let condition = ready_condition?;
+                if condition.status == "True" {
+                    return None;
+                }
+                let reason = condition
+                    .reason
+                    .clone()
+                    .filter(|reason| !reason.is_empty())
+                    .unwrap_or_else(|| "-".to_string());
+                let message = condition
+                    .message
+                    .clone()
+                    .filter(|message| !message.is_empty())
+                    .unwrap_or_else(|| "-".to_string());
+                Some(format!(
+                    "- {} status:{} reason:{} msg:{}",
+                    node.name_any(),
+                    condition.status,
+                    reason,
+                    truncate(&message, 88)
+                ))
+            })
+            .collect::<Vec<_>>();
+        not_ready_nodes.sort();
+
+        let events_api: Api<Event> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let events = events_api.list(&list_params()).await?;
+        let mut warning_events = events
+            .items
+            .into_iter()
+            .filter(|event| {
+                event
+                    .type_
+                    .as_deref()
+                    .is_some_and(|event_type| event_type.eq_ignore_ascii_case("Warning"))
+            })
+            .collect::<Vec<_>>();
+        warning_events.sort_by(|left, right| {
+            event_timestamp_seconds(right).cmp(&event_timestamp_seconds(left))
+        });
+        let warning_lines = warning_events
+            .iter()
+            .take(14)
+            .map(|event| {
+                let namespace = event.namespace().unwrap_or_else(|| "-".to_string());
+                let kind = event
+                    .involved_object
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string());
+                let object = event
+                    .involved_object
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string());
+                let reason = event.reason.clone().unwrap_or_else(|| "-".to_string());
+                let message = event.message.clone().unwrap_or_else(|| "-".to_string());
+                format!(
+                    "- [{}] {namespace} {kind}/{object} {reason} {}",
+                    event_age(event),
+                    truncate(&message, 86)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let scope_label = match scope {
+            NamespaceScope::All => "all".to_string(),
+            NamespaceScope::Named(namespace) => namespace.clone(),
+        };
+
+        let mut lines = vec![
+            format!("󰀦 Alerts scope:{scope_label}"),
+            format!(
+                "summary crashloop:{} pending:{} failed:{} restarts>=5:{} warning-events:{} not-ready-nodes:{}",
+                crash_loop_pods.len(),
+                pending_pods.len(),
+                failed_pods.len(),
+                restart_heavy_pods.len(),
+                warning_events.len(),
+                not_ready_nodes.len()
+            ),
+            String::new(),
+            "crashloop pods".to_string(),
+        ];
+        if crash_loop_pods.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(crash_loop_pods.into_iter().take(12));
+        }
+        lines.push(String::new());
+        lines.push("pending pods".to_string());
+        if pending_pods.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(pending_pods.into_iter().take(12));
+        }
+        lines.push(String::new());
+        lines.push("failed pods".to_string());
+        if failed_pods.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(failed_pods.into_iter().take(12));
+        }
+        lines.push(String::new());
+        lines.push("restart-heavy pods".to_string());
+        if restart_heavy_pods.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(restart_heavy_pods.into_iter().take(12));
+        }
+        lines.push(String::new());
+        lines.push("not-ready nodes".to_string());
+        if not_ready_nodes.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(not_ready_nodes.into_iter().take(8));
+        }
+        lines.push(String::new());
+        lines.push("warning events".to_string());
+        if warning_lines.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(warning_lines);
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     pub async fn fetch_xray_report(
         &self,
         tab: ResourceTab,
@@ -3972,6 +4171,28 @@ fn event_age(event: &Event) -> String {
     }
 
     human_age(event.metadata.creation_timestamp.as_ref())
+}
+
+fn event_timestamp_seconds(event: &Event) -> i64 {
+    event
+        .event_time
+        .as_ref()
+        .map(|time| time.0.as_second())
+        .or_else(|| event.last_timestamp.as_ref().map(|time| time.0.as_second()))
+        .or_else(|| {
+            event
+                .first_timestamp
+                .as_ref()
+                .map(|time| time.0.as_second())
+        })
+        .or_else(|| {
+            event
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|time| time.0.as_second())
+        })
+        .unwrap_or(0)
 }
 
 fn truncate(value: &str, max: usize) -> String {

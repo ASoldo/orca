@@ -145,6 +145,7 @@ pub enum AppCommand {
     },
     InspectTooling,
     InspectPulses,
+    InspectAlerts,
     InspectOps {
         target: OpsInspectTarget,
     },
@@ -1785,6 +1786,7 @@ impl App {
             "config".to_string(),
             "ops".to_string(),
             "tools".to_string(),
+            "alerts".to_string(),
             "pulses".to_string(),
             "xray".to_string(),
             "argocd".to_string(),
@@ -1890,6 +1892,7 @@ impl App {
             "readonly".to_string(),
             "config".to_string(),
             "tools".to_string(),
+            "alerts".to_string(),
             "pulses".to_string(),
             "xray".to_string(),
             "argocd".to_string(),
@@ -2266,6 +2269,7 @@ impl App {
             }
             "ops" => AppCommand::InspectTooling,
             "tools" => AppCommand::InspectTooling,
+            "alerts" | "alert" => AppCommand::InspectAlerts,
             "pulses" | "pulse" => AppCommand::InspectPulses,
             "xray" | "xr" | "x" => self.prepare_xray_command(parts.next()),
             "argocd" | "argo" => {
@@ -2495,6 +2499,10 @@ impl App {
 
         if first == "tools" {
             return AppCommand::InspectTooling;
+        }
+
+        if matches!(first.as_str(), "alerts" | "alert") {
+            return AppCommand::InspectAlerts;
         }
 
         if matches!(first.as_str(), "pulses" | "pulse") {
@@ -3657,6 +3665,8 @@ fn is_known_command_token(token: &str) -> bool {
             | "ro"
             | "config"
             | "ops"
+            | "alerts"
+            | "alert"
             | "pulses"
             | "pulse"
             | "xray"
@@ -4005,6 +4015,22 @@ mod tests {
 
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::InspectPulses);
+    }
+
+    #[test]
+    fn alerts_command_requests_alerts_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "alerts".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::InspectAlerts);
     }
 
     #[test]

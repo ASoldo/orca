@@ -778,6 +778,16 @@ async fn execute_app_command(
                 app.set_status(format!("Pulses refresh failed: {error:#}"));
             }
         },
+        AppCommand::InspectAlerts => match gateway.fetch_alerts_report(app.namespace_scope()).await
+        {
+            Ok(report) => {
+                app.set_output_overlay("Alerts", report);
+                app.set_status("Alerts snapshot refreshed");
+            }
+            Err(error) => {
+                app.set_status(format!("Alerts refresh failed: {error:#}"));
+            }
+        },
         AppCommand::InspectOps { target } => {
             let (title, report, status) = inspect_ops_target(target, app.namespace_scope()).await;
             app.set_output_overlay(title, report);
