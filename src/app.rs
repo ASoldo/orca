@@ -49,6 +49,23 @@ pub enum OpsInspectTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCommandDef {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub description: String,
+    pub mutating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRun {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub mutating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppCommand {
     None,
     RefreshActive,
@@ -127,6 +144,9 @@ pub enum AppCommand {
         tab: ResourceTab,
         namespace: Option<String>,
         name: String,
+    },
+    RunPlugin {
+        run: PluginRun,
     },
 }
 
@@ -238,6 +258,9 @@ pub struct App {
     available_contexts: Vec<String>,
     available_clusters: Vec<String>,
     available_users: Vec<String>,
+    command_aliases: HashMap<String, String>,
+    plugin_commands: Vec<PluginCommandDef>,
+    config_source: Option<String>,
     active_port_forwards: Vec<PortForwardSession>,
     overview_metrics: OverviewMetrics,
     flow_stack: Vec<FlowState>,
@@ -322,6 +345,9 @@ impl App {
             available_contexts: Vec::new(),
             available_clusters: Vec::new(),
             available_users: Vec::new(),
+            command_aliases: HashMap::new(),
+            plugin_commands: Vec::new(),
+            config_source: None,
             active_port_forwards: Vec::new(),
             overview_metrics: OverviewMetrics::default(),
             flow_stack: Vec::new(),
@@ -402,6 +428,39 @@ impl App {
         self.context_catalog = context_catalog;
     }
 
+    pub fn set_runtime_config(
+        &mut self,
+        aliases: HashMap<String, String>,
+        mut plugins: Vec<PluginCommandDef>,
+        source: Option<String>,
+    ) {
+        let mut normalized_aliases = HashMap::new();
+        for (key, value) in aliases {
+            let key = resolve_command_token(&key);
+            if key.is_empty() {
+                continue;
+            }
+            let value = normalize_mode_prefixed_input(&value);
+            if value.is_empty() {
+                continue;
+            }
+            normalized_aliases.insert(key, value);
+        }
+
+        for plugin in &mut plugins {
+            plugin.name = plugin.name.trim().to_ascii_lowercase();
+            plugin.command = plugin.command.trim().to_string();
+            plugin.description = plugin.description.trim().to_string();
+        }
+        plugins.retain(|plugin| !plugin.name.is_empty() && !plugin.command.is_empty());
+        plugins.sort_by(|left, right| left.name.cmp(&right.name));
+        plugins.dedup_by(|left, right| left.name == right.name);
+
+        self.command_aliases = normalized_aliases;
+        self.plugin_commands = plugins;
+        self.config_source = source;
+    }
+
     pub fn set_user(&mut self, user: String) {
         self.user = user;
     }
@@ -420,6 +479,14 @@ impl App {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn runtime_alias_count(&self) -> usize {
+        self.command_aliases.len()
+    }
+
+    pub fn runtime_plugin_count(&self) -> usize {
+        self.plugin_commands.len()
     }
 
     pub fn read_only(&self) -> bool {
@@ -1660,6 +1727,7 @@ impl App {
             "readonly".to_string(),
             "readonly on".to_string(),
             "readonly off".to_string(),
+            "config".to_string(),
             "ops".to_string(),
             "tools".to_string(),
             "pulses".to_string(),
@@ -1678,6 +1746,8 @@ impl App {
             "openshift".to_string(),
             "kustomize".to_string(),
             "kustomize .".to_string(),
+            "plugin".to_string(),
+            "plugin ".to_string(),
             "refresh".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
@@ -1747,6 +1817,15 @@ impl App {
             candidates.push(format!("crd {}", crd.plural));
         }
 
+        for alias in self.command_aliases.keys().take(200) {
+            candidates.push(alias.to_string());
+        }
+
+        for plugin in self.plugin_commands.iter().take(200) {
+            candidates.push(format!("plugin {}", plugin.name));
+            candidates.push(format!("plug {}", plugin.name));
+        }
+
         filter_completions(candidates, &self.input, 200)
     }
 
@@ -1754,6 +1833,7 @@ impl App {
         let mut candidates = vec![
             "ops".to_string(),
             "readonly".to_string(),
+            "config".to_string(),
             "tools".to_string(),
             "pulses".to_string(),
             "xray".to_string(),
@@ -1765,6 +1845,7 @@ impl App {
             "rbac".to_string(),
             "oc".to_string(),
             "kustomize .".to_string(),
+            "plugin".to_string(),
             "ctx ".to_string(),
             "context ".to_string(),
             "cl ".to_string(),
@@ -1797,6 +1878,14 @@ impl App {
         for user in self.available_users.iter().take(120) {
             candidates.push(format!("user {user}"));
             candidates.push(format!("usr {user}"));
+        }
+
+        for alias in self.command_aliases.keys().take(120) {
+            candidates.push(alias.to_string());
+        }
+
+        for plugin in self.plugin_commands.iter().take(120) {
+            candidates.push(format!("plugin {}", plugin.name));
         }
 
         for tab in &self.tabs {
@@ -2063,15 +2152,47 @@ impl App {
         }
     }
 
+    fn expand_alias_chain(&self, line: &str) -> String {
+        if self.command_aliases.is_empty() {
+            return line.to_string();
+        }
+
+        let mut expanded = line.trim().to_string();
+        let mut seen = HashSet::<String>::new();
+        for _ in 0..8 {
+            let mut parts = expanded.splitn(2, char::is_whitespace);
+            let head_raw = parts.next().unwrap_or_default().trim();
+            if head_raw.is_empty() {
+                break;
+            }
+            let head = resolve_command_token(head_raw);
+            let Some(alias) = self.command_aliases.get(&head) else {
+                break;
+            };
+            if !seen.insert(head) {
+                break;
+            }
+
+            let rest = parts.next().unwrap_or_default().trim();
+            expanded = if rest.is_empty() {
+                alias.clone()
+            } else {
+                format!("{alias} {rest}")
+            };
+        }
+        expanded
+    }
+
     fn execute_command_line(&mut self, line: &str) -> AppCommand {
         let normalized = normalize_mode_prefixed_input(line);
         if normalized.is_empty() {
             self.status = "No command entered".to_string();
             return AppCommand::None;
         }
+        let expanded = self.expand_alias_chain(&normalized);
         self.reset_flow_root();
 
-        let mut parts = normalized.split_whitespace();
+        let mut parts = expanded.split_whitespace();
         let command = resolve_command_token(parts.next().unwrap_or_default());
 
         match command.as_str() {
@@ -2082,6 +2203,10 @@ impl App {
             }
             "readonly" | "ro" => {
                 self.handle_read_only_command(parts.next());
+                AppCommand::None
+            }
+            "config" => {
+                self.show_runtime_config_overlay();
                 AppCommand::None
             }
             "ops" => AppCommand::InspectTooling,
@@ -2136,6 +2261,11 @@ impl App {
                 AppCommand::InspectOps {
                     target: OpsInspectTarget::KustomizeBuild { path },
                 }
+            }
+            "plugin" | "plug" => {
+                let name = parts.next().map(str::to_ascii_lowercase);
+                let extra = parts.map(str::to_string).collect::<Vec<_>>();
+                self.prepare_plugin_command(name, extra)
             }
             "refresh" | "reload" | "r" => AppCommand::RefreshActive,
             "ctx" | "context" | "use-context" => {
@@ -2276,7 +2406,7 @@ impl App {
                     let remainder = parts.collect::<Vec<_>>().join(" ");
                     return self.handle_tab_shortcut(tab, &remainder);
                 }
-                self.status = format!("Unknown command: {}", normalized);
+                self.status = format!("Unknown command: {}", expanded);
                 AppCommand::None
             }
         }
@@ -2284,7 +2414,8 @@ impl App {
 
     fn execute_jump_line(&mut self, line: &str) -> AppCommand {
         let normalized = normalize_mode_prefixed_input(line);
-        let jump = normalized.as_str();
+        let expanded = self.expand_alias_chain(&normalized);
+        let jump = expanded.as_str();
         if jump.is_empty() {
             self.status = "Jump query is empty".to_string();
             return AppCommand::None;
@@ -2299,6 +2430,11 @@ impl App {
 
         if matches!(first.as_str(), "readonly" | "ro") {
             self.handle_read_only_command(parts.next());
+            return AppCommand::None;
+        }
+
+        if first == "config" {
+            self.show_runtime_config_overlay();
             return AppCommand::None;
         }
 
@@ -2379,6 +2515,12 @@ impl App {
             return AppCommand::InspectOps {
                 target: OpsInspectTarget::KustomizeBuild { path },
             };
+        }
+
+        if matches!(first.as_str(), "plugin" | "plug") {
+            let name = parts.next().map(str::to_ascii_lowercase);
+            let extra = parts.map(str::to_string).collect::<Vec<_>>();
+            return self.prepare_plugin_command(name, extra);
         }
 
         if matches!(first.as_str(), "ctx" | "context") {
@@ -2606,6 +2748,138 @@ impl App {
 
         self.set_output_overlay(format!("users(all)[{}]", users.len()), lines.join("\n"));
         self.status = "User catalog opened (:usr <name> to switch)".to_string();
+    }
+
+    fn show_runtime_config_overlay(&mut self) {
+        let source = self
+            .config_source
+            .clone()
+            .unwrap_or_else(|| "(none)".to_string());
+
+        let mut lines = vec![
+            format!("source {source}"),
+            format!("aliases {}", self.command_aliases.len()),
+            format!("plugins {}", self.plugin_commands.len()),
+            String::new(),
+            "aliases".to_string(),
+        ];
+        if self.command_aliases.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            let mut aliases = self
+                .command_aliases
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            aliases.sort_by(|left, right| left.0.cmp(&right.0));
+            for (key, value) in aliases.into_iter().take(24) {
+                lines.push(format!("- {key} => {value}"));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("plugins".to_string());
+        if self.plugin_commands.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            for plugin in self.plugin_commands.iter().take(24) {
+                let mutate = if plugin.mutating { "mut" } else { "ro" };
+                let description = if plugin.description.is_empty() {
+                    "-".to_string()
+                } else {
+                    table_cell(&plugin.description, 72)
+                };
+                lines.push(format!(
+                    "- {} [{}] {} ({})",
+                    plugin.name, mutate, plugin.command, description
+                ));
+            }
+        }
+
+        self.set_output_overlay("Runtime Config", lines.join("\n"));
+        self.status = "Runtime config opened".to_string();
+    }
+
+    fn prepare_plugin_command(&mut self, name: Option<String>, extra: Vec<String>) -> AppCommand {
+        let Some(name) = name else {
+            self.show_runtime_config_overlay();
+            return AppCommand::None;
+        };
+
+        let Some(plugin) = self
+            .plugin_commands
+            .iter()
+            .find(|plugin| plugin.name.eq_ignore_ascii_case(&name))
+            .cloned()
+        else {
+            self.status = format!("Plugin '{name}' was not found");
+            return AppCommand::None;
+        };
+
+        if plugin.mutating && !self.ensure_write_allowed("plugin") {
+            return AppCommand::None;
+        }
+
+        let mut args = Vec::new();
+        let mut consumed_extra = false;
+        for template in &plugin.args {
+            if template == "{extra}" {
+                args.extend(extra.clone());
+                consumed_extra = true;
+                continue;
+            }
+            args.push(self.interpolate_plugin_template(template, &extra));
+        }
+        if !consumed_extra {
+            args.extend(extra.clone());
+        }
+
+        self.status = format!("Running plugin '{}'", plugin.name);
+        AppCommand::RunPlugin {
+            run: PluginRun {
+                name: plugin.name,
+                program: plugin.command,
+                args,
+                mutating: plugin.mutating,
+            },
+        }
+    }
+
+    fn interpolate_plugin_template(&self, template: &str, extra: &[String]) -> String {
+        let selected = self.active_selected_row();
+        let selected_name = selected
+            .map(|row| row.name.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let selected_namespace = selected
+            .and_then(|row| row.namespace.clone())
+            .or_else(|| match self.namespace_scope() {
+                NamespaceScope::Named(namespace) => Some(namespace.clone()),
+                NamespaceScope::All => None,
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let selected_target = if selected_namespace == "-" {
+            selected_name.clone()
+        } else {
+            format!("{selected_namespace}/{selected_name}")
+        };
+        let namespace_scope = match self.namespace_scope() {
+            NamespaceScope::All => "all".to_string(),
+            NamespaceScope::Named(namespace) => namespace.clone(),
+        };
+        let all_ns = matches!(self.namespace_scope(), NamespaceScope::All).to_string();
+        let joined_extra = extra.join(" ");
+
+        template
+            .replace("{name}", &selected_name)
+            .replace("{namespace}", &selected_namespace)
+            .replace("{target}", &selected_target)
+            .replace("{resource}", self.active_tab().short_token())
+            .replace("{context}", self.context())
+            .replace("{cluster}", self.cluster())
+            .replace("{user}", self.user())
+            .replace("{scope}", &namespace_scope)
+            .replace("{all_namespaces}", &all_ns)
+            .replace("{args}", &joined_extra)
     }
 
     fn handle_tab_shortcut(&mut self, tab: ResourceTab, remainder: &str) -> AppCommand {
@@ -3304,6 +3578,7 @@ fn is_known_command_token(token: &str) -> bool {
             | "exit"
             | "readonly"
             | "ro"
+            | "config"
             | "ops"
             | "pulses"
             | "pulse"
@@ -3323,6 +3598,8 @@ fn is_known_command_token(token: &str) -> bool {
             | "openshift"
             | "kustomize"
             | "kustom"
+            | "plugin"
+            | "plug"
             | "refresh"
             | "reload"
             | "r"
@@ -3524,10 +3801,14 @@ fn normalize_status_text(status: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppCommand, DetailPaneMode, OpsInspectTarget, normalize_mode_prefixed_input};
+    use super::{
+        App, AppCommand, DetailPaneMode, OpsInspectTarget, PluginCommandDef, PluginRun,
+        normalize_mode_prefixed_input,
+    };
     use crate::input::Action;
     use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
     use chrono::Local;
+    use std::collections::HashMap;
 
     #[test]
     fn filter_command_sets_filter() {
@@ -3735,6 +4016,115 @@ mod tests {
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::None);
         assert!(app.status().contains("Read-only mode ON"));
+    }
+
+    #[test]
+    fn runtime_alias_expands_to_target_command() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let mut aliases = HashMap::new();
+        aliases.insert("dpl".to_string(), "deploy".to_string());
+        app.set_runtime_config(aliases, Vec::new(), Some("test".to_string()));
+
+        app.apply_action(Action::StartCommand);
+        for c in "dpl".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let _ = app.apply_action(Action::SubmitInput);
+        assert_eq!(app.active_tab(), ResourceTab::Deployments);
+    }
+
+    #[test]
+    fn plugin_command_builds_run_command_with_placeholders() {
+        let mut app = App::new(
+            "clusterA".to_string(),
+            "contextA".to_string(),
+            NamespaceScope::Named("orca-sandbox".to_string()),
+        );
+        app.set_user("alice".to_string());
+
+        let now = Local::now();
+        let mut pods = TableData::default();
+        pods.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "api-123".to_string(),
+                namespace: Some("orca-sandbox".to_string()),
+                columns: vec!["api-123".to_string()],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Pods, pods);
+
+        let plugin = PluginCommandDef {
+            name: "diag".to_string(),
+            command: "kubectl".to_string(),
+            args: vec![
+                "get".to_string(),
+                "pod".to_string(),
+                "{name}".to_string(),
+                "-n".to_string(),
+                "{namespace}".to_string(),
+                "{extra}".to_string(),
+            ],
+            description: "diag".to_string(),
+            mutating: false,
+        };
+        app.set_runtime_config(HashMap::new(), vec![plugin], Some("test".to_string()));
+
+        app.apply_action(Action::StartCommand);
+        for c in "plugin diag -o yaml".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::RunPlugin {
+                run: PluginRun {
+                    name: "diag".to_string(),
+                    program: "kubectl".to_string(),
+                    args: vec![
+                        "get".to_string(),
+                        "pod".to_string(),
+                        "api-123".to_string(),
+                        "-n".to_string(),
+                        "orca-sandbox".to_string(),
+                        "-o".to_string(),
+                        "yaml".to_string()
+                    ],
+                    mutating: false
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn config_command_opens_runtime_config_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let mut aliases = HashMap::new();
+        aliases.insert("k".to_string(), "pods".to_string());
+        app.set_runtime_config(aliases, Vec::new(), Some("test".to_string()));
+
+        app.apply_action(Action::StartCommand);
+        for c in "config".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.table_overlay_active());
+        assert!(
+            app.table_overlay_text()
+                .unwrap_or_default()
+                .contains("aliases 1")
+        );
     }
 
     #[test]

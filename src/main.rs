@@ -1,12 +1,13 @@
 mod app;
 mod cli;
+mod config;
 mod input;
 mod k8s;
 mod model;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, AppCommand, OpsInspectTarget};
+use app::{App, AppCommand, OpsInspectTarget, PluginRun};
 use clap::Parser;
 use cli::CliArgs;
 use crossterm::event::{
@@ -205,6 +206,20 @@ async fn run_loop(
     refresh_ms: u64,
 ) -> Result<()> {
     app.set_status("Bootstrapping Kubernetes data…");
+    let mut config_watcher = config::RuntimeConfigWatcher::discover();
+    match config_watcher.load_current() {
+        Ok(snapshot) => {
+            app.set_runtime_config(snapshot.aliases, snapshot.plugins, snapshot.source.clone());
+        }
+        Err(error) => {
+            app.set_runtime_config(HashMap::new(), Vec::new(), None);
+            app.set_status(format!(
+                "Runtime config load failed: {}",
+                compact_error(&error)
+            ));
+        }
+    }
+
     refresh_custom_resource_catalog(app, gateway).await;
     refresh_tab(app, gateway, app.active_tab()).await;
     refresh_tab(app, gateway, ResourceTab::Namespaces).await;
@@ -283,6 +298,30 @@ async fn run_loop(
                 }
             }
             _ = ticker.tick() => {
+                match config_watcher.reload_if_changed() {
+                    Ok(Some(snapshot)) => {
+                        app.set_runtime_config(
+                            snapshot.aliases,
+                            snapshot.plugins,
+                            snapshot.source.clone(),
+                        );
+                        let source = snapshot.source.unwrap_or_else(|| "(none)".to_string());
+                        app.set_status(format!(
+                            "Runtime config reloaded from {} (aliases:{} plugins:{})",
+                            source,
+                            app.runtime_alias_count(),
+                            app.runtime_plugin_count()
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        app.set_status(format!(
+                            "Runtime config reload failed: {}",
+                            compact_error(&error)
+                        ));
+                    }
+                }
+
                 let active = app.active_tab();
                 refresh_tab(app, gateway, active).await;
 
@@ -725,6 +764,16 @@ async fn execute_app_command(
                     tab.title(),
                     name
                 ));
+            }
+        },
+        AppCommand::RunPlugin { run } => match run_plugin_command(&run).await {
+            Ok(output) => {
+                app.set_output_overlay(format!("Plugin {}", run.name), output);
+                app.set_status(format!("Plugin '{}' finished", run.name));
+            }
+            Err(error) => {
+                app.set_output_overlay(format!("Plugin {}", run.name), format!("{error:#}"));
+                app.set_status(format!("Plugin '{}' failed", run.name));
             }
         },
         AppCommand::SwitchContext { context } => match gateway.switch_context(&context).await {
@@ -1224,6 +1273,55 @@ async fn run_external_readonly(
             "{program} failed:\n{}",
             bounded_output(&rendered, 80, 220)
         ))
+    }
+}
+
+async fn run_plugin_command(run: &PluginRun) -> Result<String> {
+    let mut cmd = TokioCommand::new(&run.program);
+    cmd.args(&run.args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = timeout(Duration::from_secs(20), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("plugin '{}' timed out after 20s", run.name))?
+        .with_context(|| format!("failed to run plugin '{}'", run.name))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let mut header = vec![
+        format!("plugin {}", run.name),
+        format!("command {}", run.program),
+        format!(
+            "args {}",
+            if run.args.is_empty() {
+                "(none)".to_string()
+            } else {
+                run.args.join(" ")
+            }
+        ),
+        format!("mutating {}", run.mutating),
+        String::new(),
+    ];
+    let rendered = if stdout.is_empty() {
+        format!("stderr\n{}", bounded_output(&stderr, 260, 220))
+    } else if stderr.is_empty() {
+        format!("stdout\n{}", bounded_output(&stdout, 260, 220))
+    } else {
+        format!(
+            "stdout\n{}\n\nstderr\n{}",
+            bounded_output(&stdout, 180, 220),
+            bounded_output(&stderr, 80, 220)
+        )
+    };
+    header.push(rendered);
+
+    if output.status.success() {
+        Ok(header.join("\n"))
+    } else {
+        let mut body = header.join("\n");
+        body.push_str(&format!("\n\nexit {}", output.status));
+        Err(anyhow::anyhow!(body))
     }
 }
 

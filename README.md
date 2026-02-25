@@ -29,6 +29,7 @@
 - DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
 - Fleet pulse snapshot (`:pulses`) and resource relationship trace (`:xray`)
 - Read-only safety mode (`:readonly on|off|toggle`, `ORCA_READONLY=1`)
+- Runtime aliases/plugins from YAML config with automatic reload
 
 ## Supported resources
 
@@ -73,6 +74,7 @@
 
 `orca` uses `$KUBE_EDITOR` for `:edit`; if unset, it forwards `$EDITOR` to `kubectl`.
 Set `ORCA_READONLY=1` to start in safety mode where mutating actions are blocked.
+Set `ORCA_CONFIG=/path/to/orca.yaml` to pin a specific runtime config file.
 
 ## Run
 
@@ -167,6 +169,7 @@ Supported commands:
 - `:help`
 - `:ops`, `:tools`
 - `:readonly on|off|toggle` (`:ro`)
+- `:config` (shows loaded config source, aliases, plugins)
 - `:pulses` (`:pulse`)
 - `:xray` (`:xr`, `:x`) on selected row (or explicit target)
 - `:argocd [app-name]`
@@ -177,6 +180,7 @@ Supported commands:
 - `:rbac [subject]` (uses `kubectl auth can-i --list`, optional `--as`)
 - `:oc` (`:openshift`)
 - `:kustomize [path]`
+- `:plugin <name> [args...]` (`:plug`) runs configured plugin command
 
 Compatibility command:
 
@@ -187,6 +191,7 @@ Compatibility command:
 - Supports the same context/cluster/user and resource aliases for fast navigation
 - Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>oc`, `>kustomize`)
 - Supports observability overlays (`>pulses`, `>xray`)
+- Supports config/plugin actions (`>config`, `>plugin <name> ...`)
 - Supports namespaced targets (for example `>po my-ns/my-pod`)
 - Supports fuzzy jump by resource name/namespace when no explicit alias is provided
 - Resets to the current flow root before executing jump selection
@@ -212,12 +217,41 @@ Long names (`pods`, `deployments`, `services`, etc.) are also supported.
   - `PF` table column for Pods/Services
   - header badge for selected resource
 
+## Runtime config (`orca.yaml`)
+
+ORCA can load aliases and plugins from:
+- `ORCA_CONFIG` (if set)
+- `./orca.yaml`, `./orca.yml`, `./.orca.yaml`
+- `$HOME/.config/orca/config.yaml`
+
+Example:
+
+```yaml
+aliases:
+  d: "deployments"
+  sys: "ns kube-system"
+
+plugins:
+  - name: "describe-pod"
+    command: "kubectl"
+    args: ["describe", "pod", "{name}", "-n", "{namespace}"]
+    description: "Describe currently selected pod"
+    mutating: false
+```
+
+Supported placeholders in plugin args:
+- `{name}`, `{namespace}`, `{target}`, `{resource}`
+- `{context}`, `{cluster}`, `{user}`, `{scope}`
+- `{all_namespaces}`, `{args}`
+- `{extra}` to splice all user-supplied plugin args
+
 ## Project layout
 
 - `src/main.rs`: runtime loop, event handling, refresh/watch orchestration
 - `src/app.rs`: state machine, mode handling, command parser, drill-down flow
 - `src/input.rs`: key mapping by mode
 - `src/k8s.rs`: Kubernetes API gateway, table builders, actions, metrics, discovery
+- `src/config.rs`: runtime YAML config loader/watcher (aliases + plugins)
 - `src/ui.rs`: `ratatui` rendering, powerline bars, dashboard, syntax highlighting
 - `src/model.rs`: shared tab/data models
 - `src/cli.rs`: CLI argument definitions
