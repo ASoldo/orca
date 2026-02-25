@@ -1661,7 +1661,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     lines.push("Config: :config view runtime aliases/plugins (auto-reload)".to_string());
     lines.push("Safety: :readonly on|off|toggle (blocks mutating actions)".to_string());
     lines.push(
-        "Ops: :tools  :alerts  :argocd  :helm  :tf  :ansible  :docker  :rbac  :oc  :kustomize  :plugin"
+        "Ops: :tools  :alerts  :argocd  :helm  :tf  :ansible  :docker  :rbac  :who-can  :oc  :kustomize  :plugin"
             .to_string(),
     );
     lines.push("SRE: :pulses fleet snapshot  :xray selected-resource relations".to_string());

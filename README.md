@@ -179,6 +179,7 @@ Supported commands:
 - `:ansible` (`:ans`)
 - `:docker`
 - `:rbac [subject]` (uses `kubectl auth can-i --list`, optional `--as`)
+- `:who-can <verb> <resource> [namespace]` (uses `kubectl-who-can` plugin or `kubectl who-can`)
 - `:oc` (`:openshift`)
 - `:kustomize [path]`
 - `:plugin <name> [args...]` (`:plug`) runs configured plugin command
@@ -190,7 +191,7 @@ Compatibility command:
 ## Jump mode (`>`)
 
 - Supports the same context/cluster/user and resource aliases for fast navigation
-- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>oc`, `>kustomize`)
+- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>who-can`, `>oc`, `>kustomize`)
 - Supports observability overlays (`>pulses`, `>xray`)
 - Supports incident overlays (`>alerts`)
 - Supports config/plugin actions (`>config`, `>plugin <name> ...`)

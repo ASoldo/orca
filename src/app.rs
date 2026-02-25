@@ -37,15 +37,28 @@ pub enum TableOverlayKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsInspectTarget {
     ArgoCdApps,
-    ArgoCdApp { name: String },
+    ArgoCdApp {
+        name: String,
+    },
     HelmReleases,
-    HelmRelease { name: String },
+    HelmRelease {
+        name: String,
+    },
     TerraformOverview,
     AnsibleOverview,
     DockerOverview,
     OpenShiftProjects,
-    KustomizeBuild { path: String },
-    RbacMatrix { subject: Option<String> },
+    KustomizeBuild {
+        path: String,
+    },
+    RbacMatrix {
+        subject: Option<String>,
+    },
+    WhoCan {
+        verb: String,
+        resource: String,
+        namespace: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1799,6 +1812,8 @@ impl App {
             "docker".to_string(),
             "rbac".to_string(),
             "rbac ".to_string(),
+            "who-can ".to_string(),
+            "whocan ".to_string(),
             "oc".to_string(),
             "openshift".to_string(),
             "kustomize".to_string(),
@@ -1901,6 +1916,7 @@ impl App {
             "ansible".to_string(),
             "docker".to_string(),
             "rbac".to_string(),
+            "who-can ".to_string(),
             "oc".to_string(),
             "kustomize .".to_string(),
             "plugin".to_string(),
@@ -2312,6 +2328,23 @@ impl App {
                     subject: parts.next().map(str::to_string),
                 },
             },
+            "who-can" | "whocan" => {
+                let Some(verb) = parts.next() else {
+                    self.status = "Usage: :who-can <verb> <resource> [namespace]".to_string();
+                    return AppCommand::None;
+                };
+                let Some(resource) = parts.next() else {
+                    self.status = "Usage: :who-can <verb> <resource> [namespace]".to_string();
+                    return AppCommand::None;
+                };
+                AppCommand::InspectOps {
+                    target: OpsInspectTarget::WhoCan {
+                        verb: verb.to_string(),
+                        resource: resource.to_string(),
+                        namespace: parts.next().map(str::to_string),
+                    },
+                }
+            }
             "oc" | "openshift" => AppCommand::InspectOps {
                 target: OpsInspectTarget::OpenShiftProjects,
             },
@@ -2563,6 +2596,24 @@ impl App {
             return AppCommand::InspectOps {
                 target: OpsInspectTarget::RbacMatrix {
                     subject: parts.next().map(str::to_string),
+                },
+            };
+        }
+
+        if matches!(first.as_str(), "who-can" | "whocan") {
+            let Some(verb) = parts.next() else {
+                self.status = "Usage: >who-can <verb> <resource> [namespace]".to_string();
+                return AppCommand::None;
+            };
+            let Some(resource) = parts.next() else {
+                self.status = "Usage: >who-can <verb> <resource> [namespace]".to_string();
+                return AppCommand::None;
+            };
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::WhoCan {
+                    verb: verb.to_string(),
+                    resource: resource.to_string(),
+                    namespace: parts.next().map(str::to_string),
                 },
             };
         }
@@ -3681,6 +3732,8 @@ fn is_known_command_token(token: &str) -> bool {
             | "ans"
             | "docker"
             | "rbac"
+            | "who-can"
+            | "whocan"
             | "oc"
             | "openshift"
             | "kustomize"
@@ -3996,6 +4049,32 @@ mod tests {
             cmd,
             AppCommand::InspectOps {
                 target: OpsInspectTarget::RbacMatrix { subject: None }
+            }
+        );
+    }
+
+    #[test]
+    fn who_can_command_requests_lookup() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "who-can get pods".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::WhoCan {
+                    verb: "get".to_string(),
+                    resource: "pods".to_string(),
+                    namespace: None,
+                }
             }
         );
     }

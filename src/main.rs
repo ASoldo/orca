@@ -973,6 +973,11 @@ async fn inspect_toolchain() -> String {
             program: "kustomize",
             args: &["version"],
         },
+        ToolProbe {
+            name: "kubectl-who-can",
+            program: "kubectl-who-can",
+            args: &["--help"],
+        },
     ];
 
     let mut lines = vec![format!("{:<18} {:<10} {}", "TOOL", "STATUS", "DETAIL")];
@@ -1255,6 +1260,48 @@ async fn inspect_ops_target(
                     "RBAC matrix loaded".to_string(),
                 ),
                 Err(error) => (title, error, "RBAC matrix failed".to_string()),
+            }
+        }
+        OpsInspectTarget::WhoCan {
+            verb,
+            resource,
+            namespace,
+        } => {
+            let mut args = vec![verb.clone(), resource.clone()];
+            if let Some(namespace) = namespace.as_ref().or_else(|| match namespace_scope {
+                NamespaceScope::Named(namespace) => Some(namespace),
+                NamespaceScope::All => None,
+            }) {
+                args.push("--namespace".to_string());
+                args.push(namespace.clone());
+            }
+
+            let title = format!("WhoCan {} {}", verb, resource);
+            match run_external_readonly("kubectl-who-can", &args, 12).await {
+                Ok(output) => (
+                    title,
+                    bounded_output(&output, 260, 220),
+                    "who-can lookup loaded".to_string(),
+                ),
+                Err(primary_error) => {
+                    let mut fallback = vec!["who-can".to_string()];
+                    fallback.extend(args.clone());
+                    match run_external_readonly("kubectl", &fallback, 12).await {
+                        Ok(output) => (
+                            title,
+                            bounded_output(&output, 260, 220),
+                            "who-can lookup loaded".to_string(),
+                        ),
+                        Err(fallback_error) => (
+                            title,
+                            format!(
+                                "{}\n\nfallback kubectl who-can failed:\n{}",
+                                primary_error, fallback_error
+                            ),
+                            "who-can lookup failed".to_string(),
+                        ),
+                    }
+                }
             }
         }
         OpsInspectTarget::OpenShiftProjects => {
