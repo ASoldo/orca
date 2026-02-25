@@ -817,31 +817,6 @@ impl App {
         self.table_scroll = self.table_max_scroll();
     }
 
-    pub fn append_shell_output(&mut self, chunk: &str) {
-        if !self.shell_overlay_active() {
-            return;
-        }
-
-        let Some(overlay) = self.table_overlay.as_mut() else {
-            return;
-        };
-
-        overlay.push_str(chunk);
-        const MAX_OVERLAY_CHARS: usize = 500_000;
-        if overlay.chars().count() > MAX_OVERLAY_CHARS {
-            let trimmed = overlay
-                .chars()
-                .rev()
-                .take(MAX_OVERLAY_CHARS)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>();
-            *overlay = trimmed;
-        }
-        self.table_scroll = self.table_max_scroll();
-    }
-
     pub fn replace_shell_output(&mut self, snapshot: String) {
         if !self.shell_overlay_active() {
             return;

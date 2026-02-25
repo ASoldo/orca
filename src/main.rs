@@ -277,7 +277,7 @@ async fn run_loop(
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             if app.shell_overlay_active() {
-                                app.append_shell_output(&format!("\n[orca] shell exited: {status}\n"));
+                                let _ = app.apply_action(input::Action::ClearDetailOverlay);
                             }
                             app.set_status(format!("Embedded shell exited: {status}"));
                             should_reset_shell = true;
