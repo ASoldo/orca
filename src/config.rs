@@ -1,4 +1,4 @@
-use crate::app::PluginCommandDef;
+use crate::app::{HotkeyCommandDef, PluginCommandDef};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -11,6 +11,7 @@ pub struct RuntimeConfigSnapshot {
     pub source: Option<String>,
     pub aliases: HashMap<String, String>,
     pub plugins: Vec<PluginCommandDef>,
+    pub hotkeys: Vec<HotkeyCommandDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,8 @@ struct OrcaConfigFile {
     aliases: BTreeMap<String, String>,
     #[serde(default)]
     plugins: Vec<PluginSpec>,
+    #[serde(default)]
+    hotkeys: Vec<HotkeySpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -38,6 +41,17 @@ struct PluginSpec {
     description: String,
     #[serde(default)]
     mutating: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct HotkeySpec {
+    key: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    jump: bool,
 }
 
 impl RuntimeConfigWatcher {
@@ -54,6 +68,7 @@ impl RuntimeConfigWatcher {
                 source: None,
                 aliases: HashMap::new(),
                 plugins: Vec::new(),
+                hotkeys: Vec::new(),
             });
         };
 
@@ -77,11 +92,22 @@ impl RuntimeConfigWatcher {
                 mutating: plugin.mutating,
             })
             .collect::<Vec<_>>();
+        let hotkeys = parsed
+            .hotkeys
+            .into_iter()
+            .map(|hotkey| HotkeyCommandDef {
+                key: hotkey.key,
+                command: hotkey.command,
+                jump: hotkey.jump,
+                description: hotkey.description,
+            })
+            .collect::<Vec<_>>();
 
         Ok(RuntimeConfigSnapshot {
             source: Some(path.display().to_string()),
             aliases,
             plugins,
+            hotkeys,
         })
     }
 
@@ -105,6 +131,7 @@ impl RuntimeConfigWatcher {
                 source: None,
                 aliases: HashMap::new(),
                 plugins: Vec::new(),
+                hotkeys: Vec::new(),
             }));
         }
 

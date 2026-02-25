@@ -29,7 +29,7 @@
 - DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
 - Fleet pulse snapshot (`:pulses`) and resource relationship trace (`:xray`)
 - Read-only safety mode (`:readonly on|off|toggle`, `ORCA_READONLY=1`)
-- Runtime aliases/plugins from YAML config with automatic reload
+- Runtime aliases/plugins/hotkeys from YAML config with automatic reload
 
 ## Supported resources
 
@@ -237,6 +237,18 @@ plugins:
     args: ["describe", "pod", "{name}", "-n", "{namespace}"]
     description: "Describe currently selected pod"
     mutating: false
+
+hotkeys:
+  - key: "ctrl+shift+p"
+    command: "pulses"
+    description: "Open fleet pulses"
+  - key: "ctrl+shift+x"
+    command: "xray"
+    description: "Open xray for selected row"
+  - key: "ctrl+shift+g"
+    command: "po kube-system/coredns"
+    jump: true
+    description: "Jump directly to coredns pod"
 ```
 
 Supported placeholders in plugin args:

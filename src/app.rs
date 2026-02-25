@@ -1,4 +1,4 @@
-use crate::input::Action;
+use crate::input::{Action, normalize_hotkey_spec};
 use crate::model::{
     ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
     ResourceTab, RowData, TableData,
@@ -63,6 +63,14 @@ pub struct PluginRun {
     pub program: String,
     pub args: Vec<String>,
     pub mutating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotkeyCommandDef {
+    pub key: String,
+    pub command: String,
+    pub jump: bool,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +268,7 @@ pub struct App {
     available_users: Vec<String>,
     command_aliases: HashMap<String, String>,
     plugin_commands: Vec<PluginCommandDef>,
+    hotkey_commands: Vec<HotkeyCommandDef>,
     config_source: Option<String>,
     active_port_forwards: Vec<PortForwardSession>,
     overview_metrics: OverviewMetrics,
@@ -347,6 +356,7 @@ impl App {
             available_users: Vec::new(),
             command_aliases: HashMap::new(),
             plugin_commands: Vec::new(),
+            hotkey_commands: Vec::new(),
             config_source: None,
             active_port_forwards: Vec::new(),
             overview_metrics: OverviewMetrics::default(),
@@ -432,6 +442,7 @@ impl App {
         &mut self,
         aliases: HashMap<String, String>,
         mut plugins: Vec<PluginCommandDef>,
+        mut hotkeys: Vec<HotkeyCommandDef>,
         source: Option<String>,
     ) {
         let mut normalized_aliases = HashMap::new();
@@ -456,8 +467,25 @@ impl App {
         plugins.sort_by(|left, right| left.name.cmp(&right.name));
         plugins.dedup_by(|left, right| left.name == right.name);
 
+        for hotkey in &mut hotkeys {
+            hotkey.command = hotkey.command.trim().to_string();
+            hotkey.description = hotkey.description.trim().to_string();
+        }
+        hotkeys.retain(|hotkey| !hotkey.command.is_empty());
+        for hotkey in &mut hotkeys {
+            if let Some(normalized) = normalize_hotkey_spec(&hotkey.key) {
+                hotkey.key = normalized;
+            } else {
+                hotkey.key.clear();
+            }
+        }
+        hotkeys.retain(|hotkey| !hotkey.key.is_empty());
+        hotkeys.sort_by(|left, right| left.key.cmp(&right.key));
+        hotkeys.dedup_by(|left, right| left.key == right.key);
+
         self.command_aliases = normalized_aliases;
         self.plugin_commands = plugins;
+        self.hotkey_commands = hotkeys;
         self.config_source = source;
     }
 
@@ -489,6 +517,10 @@ impl App {
         self.plugin_commands.len()
     }
 
+    pub fn runtime_hotkey_count(&self) -> usize {
+        self.hotkey_commands.len()
+    }
+
     pub fn read_only(&self) -> bool {
         self.read_only
     }
@@ -500,6 +532,29 @@ impl App {
         } else {
             "Read-only mode disabled".to_string()
         };
+    }
+
+    pub fn execute_hotkey_signature(&mut self, signature: &str) -> Option<AppCommand> {
+        let binding = self
+            .hotkey_commands
+            .iter()
+            .find(|binding| binding.key == signature)
+            .cloned()?;
+
+        self.mode = InputMode::Normal;
+        self.input.clear();
+        self.completion_index = 0;
+        self.status = if binding.description.is_empty() {
+            format!("Hotkey {} -> {}", binding.key, binding.command)
+        } else {
+            format!("Hotkey {} -> {}", binding.key, binding.description)
+        };
+
+        Some(if binding.jump {
+            self.execute_jump_line(&binding.command)
+        } else {
+            self.execute_command_line(&binding.command)
+        })
     }
 
     pub fn show_help(&self) -> bool {
@@ -2760,6 +2815,7 @@ impl App {
             format!("source {source}"),
             format!("aliases {}", self.command_aliases.len()),
             format!("plugins {}", self.plugin_commands.len()),
+            format!("hotkeys {}", self.hotkey_commands.len()),
             String::new(),
             "aliases".to_string(),
         ];
@@ -2792,6 +2848,27 @@ impl App {
                 lines.push(format!(
                     "- {} [{}] {} ({})",
                     plugin.name, mutate, plugin.command, description
+                ));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("hotkeys".to_string());
+        if self.hotkey_commands.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            for hotkey in self.hotkey_commands.iter().take(24) {
+                let mode = if hotkey.jump { "jump" } else { "cmd" };
+                let description = if hotkey.description.is_empty() {
+                    hotkey.command.clone()
+                } else {
+                    hotkey.description.clone()
+                };
+                lines.push(format!(
+                    "- {} [{}] {}",
+                    hotkey.key,
+                    mode,
+                    table_cell(&description, 72)
                 ));
             }
         }
@@ -3802,8 +3879,8 @@ fn normalize_status_text(status: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppCommand, DetailPaneMode, OpsInspectTarget, PluginCommandDef, PluginRun,
-        normalize_mode_prefixed_input,
+        App, AppCommand, DetailPaneMode, HotkeyCommandDef, OpsInspectTarget, PluginCommandDef,
+        PluginRun, normalize_mode_prefixed_input,
     };
     use crate::input::Action;
     use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
@@ -4027,7 +4104,7 @@ mod tests {
         );
         let mut aliases = HashMap::new();
         aliases.insert("dpl".to_string(), "deploy".to_string());
-        app.set_runtime_config(aliases, Vec::new(), Some("test".to_string()));
+        app.set_runtime_config(aliases, Vec::new(), Vec::new(), Some("test".to_string()));
 
         app.apply_action(Action::StartCommand);
         for c in "dpl".chars() {
@@ -4074,7 +4151,12 @@ mod tests {
             description: "diag".to_string(),
             mutating: false,
         };
-        app.set_runtime_config(HashMap::new(), vec![plugin], Some("test".to_string()));
+        app.set_runtime_config(
+            HashMap::new(),
+            vec![plugin],
+            Vec::new(),
+            Some("test".to_string()),
+        );
 
         app.apply_action(Action::StartCommand);
         for c in "plugin diag -o yaml".chars() {
@@ -4111,7 +4193,7 @@ mod tests {
         );
         let mut aliases = HashMap::new();
         aliases.insert("k".to_string(), "pods".to_string());
-        app.set_runtime_config(aliases, Vec::new(), Some("test".to_string()));
+        app.set_runtime_config(aliases, Vec::new(), Vec::new(), Some("test".to_string()));
 
         app.apply_action(Action::StartCommand);
         for c in "config".chars() {
@@ -4125,6 +4207,29 @@ mod tests {
                 .unwrap_or_default()
                 .contains("aliases 1")
         );
+    }
+
+    #[test]
+    fn runtime_hotkey_executes_bound_command() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_runtime_config(
+            HashMap::new(),
+            Vec::new(),
+            vec![HotkeyCommandDef {
+                key: "ctrl+shift+p".to_string(),
+                command: "pulses".to_string(),
+                jump: false,
+                description: "p".to_string(),
+            }],
+            Some("test".to_string()),
+        );
+
+        let command = app.execute_hotkey_signature("ctrl+shift+p");
+        assert_eq!(command, Some(AppCommand::InspectPulses));
     }
 
     #[test]

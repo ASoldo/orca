@@ -1653,6 +1653,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     lines.push(
         "Views: Ctrl+1..9 switch/create  Ctrl+Shift+1..9 mirror  Ctrl+Alt+0..9 delete".to_string(),
     );
+    lines.push("Hotkeys: runtime bindings from orca.yaml are active in normal mode".to_string());
     lines.push(
         "Catalog: :ctx list/switch  :cluster list/switch  :usr list/switch  :ns list/scope"
             .to_string(),

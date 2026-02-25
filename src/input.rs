@@ -224,9 +224,108 @@ fn map_input_mode_key(key: KeyEvent) -> Option<Action> {
     }
 }
 
+pub fn key_event_signature(key: KeyEvent) -> Option<String> {
+    let key_name = match key.code {
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char('+') => "plus".to_string(),
+        KeyCode::Char(c) => c.to_ascii_lowercase().to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "backtab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("ctrl".to_string());
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        parts.push("alt".to_string());
+    }
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("shift".to_string());
+    }
+    parts.push(key_name);
+    Some(parts.join("+"))
+}
+
+pub fn normalize_hotkey_spec(spec: &str) -> Option<String> {
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key: Option<String> = None;
+
+    for token in spec
+        .split('+')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+    {
+        match token.as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" => alt = true,
+            "shift" => shift = true,
+            _ => {
+                key = normalize_hotkey_key_token(&token);
+            }
+        }
+    }
+
+    let key = key?;
+    let mut parts = Vec::new();
+    if ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if alt {
+        parts.push("alt".to_string());
+    }
+    if shift {
+        parts.push("shift".to_string());
+    }
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
+fn normalize_hotkey_key_token(token: &str) -> Option<String> {
+    match token {
+        "esc" | "escape" => Some("esc".to_string()),
+        "return" => Some("enter".to_string()),
+        "pgup" => Some("pageup".to_string()),
+        "pgdn" => Some("pagedown".to_string()),
+        "del" => Some("delete".to_string()),
+        "ins" => Some("insert".to_string()),
+        "space" | "plus" | "tab" | "backtab" | "enter" | "backspace" | "delete" | "insert"
+        | "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" => {
+            Some(token.to_string())
+        }
+        _ if token.len() == 1 => Some(token.to_string()),
+        _ if token.starts_with('f') => {
+            let number = token.trim_start_matches('f').parse::<u8>().ok()?;
+            if (1..=24).contains(&number) {
+                Some(format!("f{number}"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Action, map_key};
+    use super::{Action, key_event_signature, map_key, normalize_hotkey_spec};
     use crate::app::InputMode;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -341,6 +440,31 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL);
         let action = map_key(InputMode::Normal, key);
         assert_eq!(action, Some(Action::SwitchView(9)));
+    }
+
+    #[test]
+    fn hotkey_signature_normalizes_modifiers() {
+        let key = KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(key_event_signature(key), Some("ctrl+shift+p".to_string()));
+    }
+
+    #[test]
+    fn hotkey_spec_parses_common_tokens() {
+        assert_eq!(
+            normalize_hotkey_spec("shift+ctrl+F5"),
+            Some("ctrl+shift+f5".to_string())
+        );
+        assert_eq!(
+            normalize_hotkey_spec("ctrl+alt+1"),
+            Some("ctrl+alt+1".to_string())
+        );
+        assert_eq!(
+            normalize_hotkey_spec("ctrl+pgup"),
+            Some("ctrl+pageup".to_string())
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ use crossterm::terminal::{
     supports_keyboard_enhancement,
 };
 use futures::{StreamExt, TryStreamExt};
+use input::key_event_signature;
 use k8s::KubeGateway;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
 use k8s_openapi::api::batch::v1::{CronJob, Job};
@@ -209,10 +210,15 @@ async fn run_loop(
     let mut config_watcher = config::RuntimeConfigWatcher::discover();
     match config_watcher.load_current() {
         Ok(snapshot) => {
-            app.set_runtime_config(snapshot.aliases, snapshot.plugins, snapshot.source.clone());
+            app.set_runtime_config(
+                snapshot.aliases,
+                snapshot.plugins,
+                snapshot.hotkeys,
+                snapshot.source.clone(),
+            );
         }
         Err(error) => {
-            app.set_runtime_config(HashMap::new(), Vec::new(), None);
+            app.set_runtime_config(HashMap::new(), Vec::new(), Vec::new(), None);
             app.set_status(format!(
                 "Runtime config load failed: {}",
                 compact_error(&error)
@@ -260,6 +266,39 @@ async fn run_loop(
                             continue;
                         }
 
+                        if app.mode() == app::InputMode::Normal
+                            && let Some(signature) = key_event_signature(key.clone())
+                            && let Some(command) = app.execute_hotkey_signature(&signature)
+                        {
+                            let was_shell_open = app.shell_overlay_active();
+                            terminal
+                                .draw(|frame| ui::render(frame, app))
+                                .context("failed to render terminal frame")?;
+                            let effect =
+                                execute_app_command(
+                                    terminal,
+                                    app,
+                                    gateway,
+                                    command,
+                                    &pf_tx,
+                                    &shell_output_tx,
+                                    &mut embedded_shell,
+                                )
+                                .await;
+                            if was_shell_open && !app.shell_overlay_active() {
+                                stop_embedded_shell(&mut embedded_shell).await;
+                            }
+                            if matches!(effect, LoopEffect::RestartWatchers) {
+                                restart_watchers(
+                                    &mut watch_tasks,
+                                    gateway.client(),
+                                    watch_tx.clone(),
+                                );
+                                watch_throttle.clear();
+                            }
+                            continue;
+                        }
+
                         if let Some(action) = input::map_key(app.mode(), key) {
                             debug!("action={action:?}");
                             let was_shell_open = app.shell_overlay_active();
@@ -303,14 +342,16 @@ async fn run_loop(
                         app.set_runtime_config(
                             snapshot.aliases,
                             snapshot.plugins,
+                            snapshot.hotkeys,
                             snapshot.source.clone(),
                         );
                         let source = snapshot.source.unwrap_or_else(|| "(none)".to_string());
                         app.set_status(format!(
-                            "Runtime config reloaded from {} (aliases:{} plugins:{})",
+                            "Runtime config reloaded from {} (aliases:{} plugins:{} hotkeys:{})",
                             source,
                             app.runtime_alias_count(),
-                            app.runtime_plugin_count()
+                            app.runtime_plugin_count(),
+                            app.runtime_hotkey_count(),
                         ));
                     }
                     Ok(None) => {}
