@@ -675,11 +675,45 @@ async fn execute_app_command(
             app.set_output_overlay("Toolchain Inventory", report);
             app.set_status("Toolchain inventory refreshed");
         }
+        AppCommand::InspectPulses => match gateway.fetch_pulses_report(app.namespace_scope()).await
+        {
+            Ok(report) => {
+                app.set_output_overlay("Pulses", report);
+                app.set_status("Pulses snapshot refreshed");
+            }
+            Err(error) => {
+                app.set_status(format!("Pulses refresh failed: {error:#}"));
+            }
+        },
         AppCommand::InspectOps { target } => {
             let (title, report, status) = inspect_ops_target(target, app.namespace_scope()).await;
             app.set_output_overlay(title, report);
             app.set_status(status);
         }
+        AppCommand::InspectXray {
+            tab,
+            namespace,
+            name,
+        } => match gateway
+            .fetch_xray_report(tab, namespace.as_deref(), &name)
+            .await
+        {
+            Ok(report) => {
+                let title = match namespace {
+                    Some(namespace) => format!("Xray {} {namespace}/{name}", tab.title()),
+                    None => format!("Xray {} {name}", tab.title()),
+                };
+                app.set_output_overlay(title, report);
+                app.set_status(format!("Xray refreshed for {} {}", tab.title(), name));
+            }
+            Err(error) => {
+                app.set_status(format!(
+                    "Xray failed for {} {}: {error:#}",
+                    tab.title(),
+                    name
+                ));
+            }
+        },
         AppCommand::SwitchContext { context } => match gateway.switch_context(&context).await {
             Ok(()) => {
                 app.set_kube_target(

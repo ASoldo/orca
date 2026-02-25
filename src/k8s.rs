@@ -17,7 +17,7 @@ use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::{Api, Client, Config, ResourceExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::model::{
     ContextCatalogRow, CustomResourceDef, NamespaceScope, OverviewMetrics, PodContainerInfo,
@@ -2403,6 +2403,1101 @@ impl KubeGateway {
             source: format!("service {namespace}/{service_name}"),
         })
     }
+
+    pub async fn fetch_pulses_report(&self, scope: &NamespaceScope) -> Result<String> {
+        let pods_api: Api<Pod> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let pods = pods_api.list(&list_params()).await?;
+
+        let mut pod_running = 0usize;
+        let mut pod_pending = 0usize;
+        let mut pod_failed = 0usize;
+        let mut pod_succeeded = 0usize;
+        let mut pod_unknown = 0usize;
+        let mut pod_not_ready = 0usize;
+        let mut pod_crash_loop = 0usize;
+        for pod in &pods.items {
+            let phase = pod
+                .status
+                .as_ref()
+                .and_then(|status| status.phase.as_deref())
+                .unwrap_or("Unknown");
+            match phase {
+                "Running" => pod_running = pod_running.saturating_add(1),
+                "Pending" => pod_pending = pod_pending.saturating_add(1),
+                "Failed" => pod_failed = pod_failed.saturating_add(1),
+                "Succeeded" => pod_succeeded = pod_succeeded.saturating_add(1),
+                _ => pod_unknown = pod_unknown.saturating_add(1),
+            }
+
+            if let Some(status) = pod.status.as_ref() {
+                let (ready, total, _) = pod_readiness(status);
+                if total > 0 && ready < total {
+                    pod_not_ready = pod_not_ready.saturating_add(1);
+                }
+                let is_crash_loop = status.container_statuses.as_ref().is_some_and(|statuses| {
+                    statuses.iter().any(|container| {
+                        container
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.waiting.as_ref())
+                            .and_then(|waiting| waiting.reason.as_deref())
+                            .is_some_and(|reason| reason.eq_ignore_ascii_case("CrashLoopBackOff"))
+                    })
+                });
+                if is_crash_loop {
+                    pod_crash_loop = pod_crash_loop.saturating_add(1);
+                }
+            }
+        }
+
+        let deployments_api: Api<Deployment> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let deployments = deployments_api.list(&list_params()).await?;
+        let deployment_desired = deployments
+            .items
+            .iter()
+            .map(|deployment| {
+                deployment
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1) as i64
+            })
+            .sum::<i64>();
+        let deployment_ready = deployments
+            .items
+            .iter()
+            .map(|deployment| {
+                deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+        let deployment_available = deployments
+            .items
+            .iter()
+            .map(|deployment| {
+                deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.available_replicas)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+
+        let statefulsets_api: Api<StatefulSet> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let statefulsets = statefulsets_api.list(&list_params()).await?;
+        let statefulset_desired = statefulsets
+            .items
+            .iter()
+            .map(|statefulset| {
+                statefulset
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1) as i64
+            })
+            .sum::<i64>();
+        let statefulset_ready = statefulsets
+            .items
+            .iter()
+            .map(|statefulset| {
+                statefulset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+
+        let daemonsets_api: Api<DaemonSet> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let daemonsets = daemonsets_api.list(&list_params()).await?;
+        let daemonset_desired = daemonsets
+            .items
+            .iter()
+            .map(|daemonset| {
+                daemonset
+                    .status
+                    .as_ref()
+                    .map(|status| status.desired_number_scheduled as i64)
+                    .unwrap_or(0)
+            })
+            .sum::<i64>();
+        let daemonset_ready = daemonsets
+            .items
+            .iter()
+            .map(|daemonset| {
+                daemonset
+                    .status
+                    .as_ref()
+                    .map(|status| status.number_ready as i64)
+                    .unwrap_or(0)
+            })
+            .sum::<i64>();
+
+        let jobs_api: Api<Job> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let jobs = jobs_api.list(&list_params()).await?;
+        let job_active = jobs
+            .items
+            .iter()
+            .map(|job| {
+                job.status
+                    .as_ref()
+                    .and_then(|status| status.active)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+        let job_succeeded = jobs
+            .items
+            .iter()
+            .map(|job| {
+                job.status
+                    .as_ref()
+                    .and_then(|status| status.succeeded)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+        let job_failed = jobs
+            .items
+            .iter()
+            .map(|job| {
+                job.status
+                    .as_ref()
+                    .and_then(|status| status.failed)
+                    .unwrap_or(0) as i64
+            })
+            .sum::<i64>();
+
+        let cronjobs_api: Api<CronJob> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let cronjobs = cronjobs_api.list(&list_params()).await?;
+        let cronjob_suspended = cronjobs
+            .items
+            .iter()
+            .filter(|cronjob| {
+                cronjob
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.suspend)
+                    .unwrap_or(false)
+            })
+            .count();
+
+        let services_api: Api<Service> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let services = services_api.list(&list_params()).await?;
+        let service_node_port = services
+            .items
+            .iter()
+            .filter(|service| {
+                service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.type_.as_deref())
+                    .is_some_and(|value| value == "NodePort")
+            })
+            .count();
+        let service_load_balancer = services
+            .items
+            .iter()
+            .filter(|service| {
+                service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.type_.as_deref())
+                    .is_some_and(|value| value == "LoadBalancer")
+            })
+            .count();
+
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let nodes = nodes.list(&list_params()).await?;
+        let node_ready = nodes
+            .items
+            .iter()
+            .filter(|node| {
+                node.status
+                    .as_ref()
+                    .and_then(|status| status.conditions.as_ref())
+                    .and_then(|conditions| {
+                        conditions
+                            .iter()
+                            .find(|condition| condition.type_ == "Ready")
+                    })
+                    .is_some_and(|condition| condition.status == "True")
+            })
+            .count();
+
+        let events_api: Api<Event> = match scope {
+            NamespaceScope::All => Api::all(self.client.clone()),
+            NamespaceScope::Named(namespace) => Api::namespaced(self.client.clone(), namespace),
+        };
+        let events = events_api.list(&list_params()).await?;
+        let warning_events = events
+            .items
+            .iter()
+            .filter(|event| {
+                event
+                    .type_
+                    .as_deref()
+                    .is_some_and(|event_type| event_type.eq_ignore_ascii_case("Warning"))
+            })
+            .count();
+
+        let metrics = self.fetch_overview_metrics(scope).await.ok();
+        let cpu_line = if let Some(metrics) = metrics.as_ref() {
+            let percent = metrics
+                .cpu_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "󰾆 CPU {} / {} ({})",
+                format_cpu_millicores(metrics.cpu_usage_millicores),
+                format_cpu_millicores(metrics.cpu_capacity_millicores),
+                percent
+            )
+        } else {
+            "󰾆 CPU n/a (metrics-server unavailable or timed out)".to_string()
+        };
+        let memory_line = if let Some(metrics) = metrics.as_ref() {
+            let percent = metrics
+                .memory_percent
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "󰍛 RAM {} / {} ({})",
+                format_bytes(metrics.memory_usage_bytes),
+                format_bytes(metrics.memory_capacity_bytes),
+                percent
+            )
+        } else {
+            "󰍛 RAM n/a (metrics-server unavailable or timed out)".to_string()
+        };
+
+        let scope_label = match scope {
+            NamespaceScope::All => "all".to_string(),
+            NamespaceScope::Named(namespace) => namespace.clone(),
+        };
+        Ok([
+            format!("󰠳 Scope: {scope_label}"),
+            format!(
+                "󰋊 Pods total:{} run:{} pend:{} fail:{} succ:{} unk:{} notReady:{} crashLoop:{}",
+                pods.items.len(),
+                pod_running,
+                pod_pending,
+                pod_failed,
+                pod_succeeded,
+                pod_unknown,
+                pod_not_ready,
+                pod_crash_loop
+            ),
+            format!(
+                "󰹑 Deployments:{} ready:{}/{} avail:{}",
+                deployments.items.len(),
+                deployment_ready,
+                deployment_desired,
+                deployment_available
+            ),
+            format!(
+                "󰛨 StatefulSets:{} ready:{}/{}",
+                statefulsets.items.len(),
+                statefulset_ready,
+                statefulset_desired
+            ),
+            format!(
+                "󰠱 DaemonSets:{} ready:{}/{}",
+                daemonsets.items.len(),
+                daemonset_ready,
+                daemonset_desired
+            ),
+            format!(
+                "󰁨 Jobs:{} active:{} done:{} failed:{}  󰃰 CronJobs:{} suspended:{}",
+                jobs.items.len(),
+                job_active,
+                job_succeeded,
+                job_failed,
+                cronjobs.items.len(),
+                cronjob_suspended
+            ),
+            format!(
+                "󰒓 Services:{} nodePort:{} loadBalancer:{}",
+                services.items.len(),
+                service_node_port,
+                service_load_balancer
+            ),
+            format!("󰒋 Nodes ready:{}/{}", node_ready, nodes.items.len()),
+            format!(
+                "󰀦 Events warning:{warning_events} total:{}",
+                events.items.len()
+            ),
+            cpu_line,
+            memory_line,
+            "Tip: use :xray on a selected row for relationship traces".to_string(),
+        ]
+        .join("\n"))
+    }
+
+    pub async fn fetch_xray_report(
+        &self,
+        tab: ResourceTab,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        match tab {
+            ResourceTab::Pods => {
+                let namespace = resolve_namespace_target(namespace, &self.default_namespace)?;
+                self.fetch_pod_xray(&namespace, name).await
+            }
+            ResourceTab::Deployments
+            | ResourceTab::DaemonSets
+            | ResourceTab::StatefulSets
+            | ResourceTab::ReplicaSets
+            | ResourceTab::ReplicationControllers
+            | ResourceTab::Jobs
+            | ResourceTab::CronJobs => {
+                let namespace = resolve_namespace_target(namespace, &self.default_namespace)?;
+                self.fetch_workload_xray(tab, &namespace, name).await
+            }
+            ResourceTab::Services => {
+                let namespace = resolve_namespace_target(namespace, &self.default_namespace)?;
+                self.fetch_service_xray(&namespace, name).await
+            }
+            ResourceTab::Nodes => self.fetch_node_xray(name).await,
+            ResourceTab::Namespaces => self.fetch_namespace_xray(name).await,
+            _ => anyhow::bail!("xray is not implemented for {}", tab.title()),
+        }
+    }
+
+    async fn fetch_pod_xray(&self, namespace: &str, pod_name: &str) -> Result<String> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod = pods
+            .get(pod_name)
+            .await
+            .with_context(|| format!("failed to fetch pod {namespace}/{pod_name}"))?;
+
+        let phase = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let node = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.node_name.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let pod_ip = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.pod_ip.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let host_ip = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.host_ip.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let age = human_age(pod.metadata.creation_timestamp.as_ref());
+        let (ready, total, restarts) = pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
+        let owner_line = pod
+            .metadata
+            .owner_references
+            .as_ref()
+            .map(|owners| {
+                owners
+                    .iter()
+                    .map(|owner| format!("{}:{}", owner.kind, owner.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        let labels = pod.metadata.labels.clone().unwrap_or_default();
+        let label_line = if labels.is_empty() {
+            "-".to_string()
+        } else {
+            let mut pairs = labels
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>();
+            pairs.sort();
+            truncate(&pairs.join(", "), 180)
+        };
+
+        let containers = self
+            .pod_containers(namespace, pod_name)
+            .await
+            .unwrap_or_default();
+        let container_lines = if containers.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            containers
+                .iter()
+                .map(|container| {
+                    format!(
+                        "- {} image:{} ready:{} state:{} rst:{} age:{}",
+                        container.name,
+                        truncate(&container.image, 46),
+                        container.ready,
+                        container.state,
+                        container.restarts,
+                        container.age
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let services_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let services = services_api.list(&list_params()).await?;
+        let related_services = services
+            .items
+            .iter()
+            .filter(|service| service_selector_matches_labels(service, &labels))
+            .map(|service| {
+                let service_type = service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.type_.clone())
+                    .unwrap_or_else(|| "ClusterIP".to_string());
+                let ports = service_ports_summary(service);
+                format!("- {} ({service_type}) ports:{ports}", service.name_any())
+            })
+            .collect::<Vec<_>>();
+
+        let events_api: Api<Event> = Api::namespaced(self.client.clone(), namespace);
+        let events = events_api.list(&list_params()).await?;
+        let mut related_events = events
+            .items
+            .into_iter()
+            .filter(|event| {
+                event.involved_object.kind.as_deref() == Some("Pod")
+                    && event.involved_object.name.as_deref() == Some(pod_name)
+            })
+            .collect::<Vec<_>>();
+        related_events.sort_by(|left, right| event_age(left).cmp(&event_age(right)));
+        related_events.reverse();
+        let event_lines = if related_events.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            related_events
+                .iter()
+                .take(8)
+                .map(|event| {
+                    let event_type = event.type_.clone().unwrap_or_else(|| "-".to_string());
+                    let reason = event.reason.clone().unwrap_or_else(|| "-".to_string());
+                    let message = event.message.clone().unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "- [{}] {} {} {}",
+                        event_age(event),
+                        event_type,
+                        reason,
+                        truncate(&message, 120)
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut lines = vec![
+            format!("󰋊 Pod {namespace}/{pod_name}"),
+            format!("status phase:{phase} ready:{ready}/{total} restarts:{restarts} age:{age}"),
+            format!("node {node} podIP:{pod_ip} hostIP:{host_ip}"),
+            format!("owner {owner_line}"),
+            format!("labels {label_line}"),
+            String::new(),
+            "containers".to_string(),
+        ];
+        lines.extend(container_lines);
+        lines.push(String::new());
+        lines.push("services".to_string());
+        if related_services.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(related_services);
+        }
+        lines.push(String::new());
+        lines.push("events".to_string());
+        lines.extend(event_lines);
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn fetch_workload_xray(
+        &self,
+        tab: ResourceTab,
+        namespace: &str,
+        workload_name: &str,
+    ) -> Result<String> {
+        let scale_line = self
+            .workload_scale_line(tab, namespace, workload_name)
+            .await
+            .unwrap_or_else(|_| "scale unavailable".to_string());
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod_list = pods.list(&list_params()).await?;
+        let owner_kind = owner_kind_for_tab(tab);
+        let mut related_pods = pod_list
+            .items
+            .iter()
+            .map(|pod| (pod_relation_score(pod, workload_name, owner_kind), pod))
+            .filter(|(score, _)| *score > 0)
+            .collect::<Vec<_>>();
+        related_pods.sort_by(|left, right| right.0.cmp(&left.0));
+
+        let pod_lines = if related_pods.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            related_pods
+                .iter()
+                .take(14)
+                .map(|(_, pod)| {
+                    let phase = pod
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.phase.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    let (ready, total, restarts) =
+                        pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
+                    let node = pod
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.node_name.clone())
+                        .unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "- {} phase:{} ready:{}/{} rst:{} node:{}",
+                        pod.name_any(),
+                        phase,
+                        ready,
+                        total,
+                        restarts,
+                        node
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let service_label_source = related_pods
+            .first()
+            .and_then(|(_, pod)| pod.metadata.labels.as_ref().cloned())
+            .unwrap_or_default();
+        let services_api: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let services = services_api.list(&list_params()).await?;
+        let related_services = services
+            .items
+            .iter()
+            .filter(|service| service_selector_matches_labels(service, &service_label_source))
+            .map(|service| {
+                let service_type = service
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.type_.clone())
+                    .unwrap_or_else(|| "ClusterIP".to_string());
+                format!(
+                    "- {} ({service_type}) ports:{}",
+                    service.name_any(),
+                    service_ports_summary(service)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let events_api: Api<Event> = Api::namespaced(self.client.clone(), namespace);
+        let events = events_api.list(&list_params()).await?;
+        let mut related_events = events
+            .items
+            .into_iter()
+            .filter(|event| {
+                event.involved_object.name.as_deref() == Some(workload_name)
+                    && owner_kind
+                        .is_none_or(|kind| event.involved_object.kind.as_deref() == Some(kind))
+            })
+            .collect::<Vec<_>>();
+        related_events.sort_by(|left, right| event_age(left).cmp(&event_age(right)));
+        related_events.reverse();
+        let event_lines = if related_events.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            related_events
+                .iter()
+                .take(8)
+                .map(|event| {
+                    let event_type = event.type_.clone().unwrap_or_else(|| "-".to_string());
+                    let reason = event.reason.clone().unwrap_or_else(|| "-".to_string());
+                    let message = event.message.clone().unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "- [{}] {} {} {}",
+                        event_age(event),
+                        event_type,
+                        reason,
+                        truncate(&message, 120)
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut lines = vec![
+            format!("󰓦 Xray {} {namespace}/{workload_name}", tab.title()),
+            format!("scale {scale_line}"),
+            format!("pods related:{}", related_pods.len()),
+        ];
+        lines.extend(pod_lines);
+        lines.push(String::new());
+        lines.push("services".to_string());
+        if related_services.is_empty() {
+            lines.push("-".to_string());
+        } else {
+            lines.extend(related_services);
+        }
+        lines.push(String::new());
+        lines.push("events".to_string());
+        lines.extend(event_lines);
+        Ok(lines.join("\n"))
+    }
+
+    async fn fetch_service_xray(&self, namespace: &str, service_name: &str) -> Result<String> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service = services
+            .get(service_name)
+            .await
+            .with_context(|| format!("failed to fetch service {namespace}/{service_name}"))?;
+
+        let service_type = service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.type_.clone())
+            .unwrap_or_else(|| "ClusterIP".to_string());
+        let cluster_ip = service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.cluster_ip.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let age = human_age(service.metadata.creation_timestamp.as_ref());
+        let ports = service_ports_summary(&service);
+        let selector = service
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.selector.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let selector_line = if selector.is_empty() {
+            "-".to_string()
+        } else {
+            selector
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let pod_list = if selector.is_empty() {
+            pods.list(&list_params()).await?
+        } else {
+            pods.list(&list_params().labels(&selector_query(&selector)))
+                .await?
+        };
+        let pod_lines = if selector.is_empty() {
+            vec!["- service has no selector".to_string()]
+        } else if pod_list.items.is_empty() {
+            vec!["- no pods matched service selector".to_string()]
+        } else {
+            pod_list
+                .items
+                .iter()
+                .take(16)
+                .map(|pod| {
+                    let phase = pod
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.phase.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    let (ready, total, restarts) =
+                        pod.status.as_ref().map(pod_readiness).unwrap_or((0, 0, 0));
+                    let node = pod
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.node_name.clone())
+                        .unwrap_or_else(|| "-".to_string());
+                    format!(
+                        "- {} phase:{} ready:{}/{} rst:{} node:{}",
+                        pod.name_any(),
+                        phase,
+                        ready,
+                        total,
+                        restarts,
+                        node
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        Ok([
+            format!("󰒓 Service {namespace}/{service_name}"),
+            format!("type:{service_type} clusterIP:{cluster_ip} ports:{ports} age:{age}"),
+            format!("selector {selector_line}"),
+            String::new(),
+            "pods".to_string(),
+            pod_lines.join("\n"),
+        ]
+        .join("\n"))
+    }
+
+    async fn fetch_node_xray(&self, node_name: &str) -> Result<String> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let node = nodes
+            .get(node_name)
+            .await
+            .with_context(|| format!("failed to fetch node {node_name}"))?;
+
+        let ready = node
+            .status
+            .as_ref()
+            .and_then(|status| status.conditions.as_ref())
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|condition| condition.type_ == "Ready")
+            })
+            .map(|condition| condition.status.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        let version = node
+            .status
+            .as_ref()
+            .and_then(|status| status.node_info.as_ref())
+            .map(|info| info.kubelet_version.clone())
+            .unwrap_or_else(|| "-".to_string());
+        let roles = node_roles(&node);
+        let age = human_age(node.metadata.creation_timestamp.as_ref());
+
+        let pods: Api<Pod> = Api::all(self.client.clone());
+        let pod_list = pods.list(&list_params()).await?;
+        let mut namespace_counts = HashMap::<String, usize>::new();
+        let related_pods = pod_list
+            .items
+            .iter()
+            .filter(|pod| {
+                pod.spec
+                    .as_ref()
+                    .and_then(|spec| spec.node_name.as_deref())
+                    .is_some_and(|name| name == node_name)
+            })
+            .inspect(|pod| {
+                let namespace = pod.namespace().unwrap_or_else(|| "-".to_string());
+                let entry = namespace_counts.entry(namespace).or_insert(0);
+                *entry = entry.saturating_add(1);
+            })
+            .collect::<Vec<_>>();
+
+        let pod_lines = if related_pods.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            related_pods
+                .iter()
+                .take(18)
+                .map(|pod| {
+                    let namespace = pod.namespace().unwrap_or_else(|| "-".to_string());
+                    let phase = pod
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.phase.clone())
+                        .unwrap_or_else(|| "Unknown".to_string());
+                    format!("- {namespace}/{} phase:{phase}", pod.name_any())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut namespace_lines = namespace_counts.into_iter().collect::<Vec<_>>();
+        namespace_lines.sort_by(|left, right| right.1.cmp(&left.1));
+        let namespace_lines = if namespace_lines.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            namespace_lines
+                .iter()
+                .take(8)
+                .map(|(namespace, count)| format!("- {namespace}: {count}"))
+                .collect::<Vec<_>>()
+        };
+
+        let mut lines = vec![
+            format!("󰒋 Node {node_name}"),
+            format!("ready:{ready} roles:{roles} version:{version} age:{age}"),
+            format!("pods on node:{}", related_pods.len()),
+            String::new(),
+            "pod namespaces".to_string(),
+        ];
+        lines.extend(namespace_lines);
+        lines.push(String::new());
+        lines.push("pods".to_string());
+        lines.extend(pod_lines);
+        Ok(lines.join("\n"))
+    }
+
+    async fn fetch_namespace_xray(&self, namespace: &str) -> Result<String> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let deployments: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let jobs: Api<Job> = Api::namespaced(self.client.clone(), namespace);
+        let cronjobs: Api<CronJob> = Api::namespaced(self.client.clone(), namespace);
+        let configmaps: Api<ConfigMap> = Api::namespaced(self.client.clone(), namespace);
+        let secrets: Api<Secret> = Api::namespaced(self.client.clone(), namespace);
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), namespace);
+        let events: Api<Event> = Api::namespaced(self.client.clone(), namespace);
+
+        let pods = pods.list(&list_params()).await?;
+        let deployments = deployments.list(&list_params()).await?;
+        let services = services.list(&list_params()).await?;
+        let jobs = jobs.list(&list_params()).await?;
+        let cronjobs = cronjobs.list(&list_params()).await?;
+        let configmaps = configmaps.list(&list_params()).await?;
+        let secrets = secrets.list(&list_params()).await?;
+        let pvcs = pvcs.list(&list_params()).await?;
+        let events = events.list(&list_params()).await?;
+
+        let running_pods = pods
+            .items
+            .iter()
+            .filter(|pod| {
+                pod.status
+                    .as_ref()
+                    .and_then(|status| status.phase.as_deref())
+                    .is_some_and(|phase| phase == "Running")
+            })
+            .count();
+        let warning_events = events
+            .items
+            .iter()
+            .filter(|event| {
+                event
+                    .type_
+                    .as_deref()
+                    .is_some_and(|event_type| event_type.eq_ignore_ascii_case("Warning"))
+            })
+            .count();
+
+        let mut lines = vec![
+            format!("󰉖 Namespace {namespace}"),
+            format!("pods:{} running:{}", pods.items.len(), running_pods),
+            format!(
+                "deployments:{} services:{} jobs:{} cronjobs:{}",
+                deployments.items.len(),
+                services.items.len(),
+                jobs.items.len(),
+                cronjobs.items.len()
+            ),
+            format!(
+                "configmaps:{} secrets:{} pvc:{} events:{} warnings:{}",
+                configmaps.items.len(),
+                secrets.items.len(),
+                pvcs.items.len(),
+                events.items.len(),
+                warning_events
+            ),
+            String::new(),
+            "sample workloads".to_string(),
+        ];
+        lines.extend(
+            deployments
+                .items
+                .iter()
+                .take(8)
+                .map(|deployment| {
+                    let desired = deployment
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| spec.replicas)
+                        .unwrap_or(1);
+                    let ready = deployment
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.ready_replicas)
+                        .unwrap_or(0);
+                    format!("- {} ready:{ready}/{desired}", deployment.name_any())
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn workload_scale_line(
+        &self,
+        tab: ResourceTab,
+        namespace: &str,
+        name: &str,
+    ) -> Result<String> {
+        match tab {
+            ResourceTab::Deployments => {
+                let api: Api<Deployment> = Api::namespaced(self.client.clone(), namespace);
+                let deployment = api.get(name).await?;
+                let desired = deployment
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1);
+                let ready = deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0);
+                let available = deployment
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.available_replicas)
+                    .unwrap_or(0);
+                Ok(format!("ready:{ready}/{desired} available:{available}"))
+            }
+            ResourceTab::DaemonSets => {
+                let api: Api<DaemonSet> = Api::namespaced(self.client.clone(), namespace);
+                let daemonset = api.get(name).await?;
+                let desired = daemonset
+                    .status
+                    .as_ref()
+                    .map(|status| status.desired_number_scheduled)
+                    .unwrap_or(0);
+                let ready = daemonset
+                    .status
+                    .as_ref()
+                    .map(|status| status.number_ready)
+                    .unwrap_or(0);
+                let available = daemonset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.number_available)
+                    .unwrap_or(0);
+                Ok(format!("ready:{ready}/{desired} available:{available}"))
+            }
+            ResourceTab::StatefulSets => {
+                let api: Api<StatefulSet> = Api::namespaced(self.client.clone(), namespace);
+                let statefulset = api.get(name).await?;
+                let desired = statefulset
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1);
+                let ready = statefulset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0);
+                let current = statefulset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.current_replicas)
+                    .unwrap_or(0);
+                Ok(format!("ready:{ready}/{desired} current:{current}"))
+            }
+            ResourceTab::ReplicaSets => {
+                let api: Api<ReplicaSet> = Api::namespaced(self.client.clone(), namespace);
+                let replicaset = api.get(name).await?;
+                let desired = replicaset
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1);
+                let ready = replicaset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0);
+                let available = replicaset
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.available_replicas)
+                    .unwrap_or(0);
+                Ok(format!("ready:{ready}/{desired} available:{available}"))
+            }
+            ResourceTab::ReplicationControllers => {
+                let api: Api<ReplicationController> =
+                    Api::namespaced(self.client.clone(), namespace);
+                let controller = api.get(name).await?;
+                let desired = controller
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.replicas)
+                    .unwrap_or(1);
+                let ready = controller
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.ready_replicas)
+                    .unwrap_or(0);
+                let current = controller
+                    .status
+                    .as_ref()
+                    .map(|status| status.replicas)
+                    .unwrap_or(0);
+                Ok(format!("ready:{ready}/{desired} current:{current}"))
+            }
+            ResourceTab::Jobs => {
+                let api: Api<Job> = Api::namespaced(self.client.clone(), namespace);
+                let job = api.get(name).await?;
+                let completions = job
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.completions)
+                    .unwrap_or(1);
+                let active = job
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.active)
+                    .unwrap_or(0);
+                let succeeded = job
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.succeeded)
+                    .unwrap_or(0);
+                let failed = job
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.failed)
+                    .unwrap_or(0);
+                Ok(format!(
+                    "active:{active} done:{succeeded}/{completions} failed:{failed}"
+                ))
+            }
+            ResourceTab::CronJobs => {
+                let api: Api<CronJob> = Api::namespaced(self.client.clone(), namespace);
+                let cronjob = api.get(name).await?;
+                let schedule = cronjob
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.schedule.clone())
+                    .unwrap_or_else(|| "-".to_string());
+                let suspended = cronjob
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| spec.suspend)
+                    .unwrap_or(false);
+                let active = cronjob
+                    .status
+                    .as_ref()
+                    .and_then(|status| status.active.as_ref())
+                    .map(|items| items.len())
+                    .unwrap_or(0);
+                Ok(format!(
+                    "schedule:{} suspend:{} active:{}",
+                    truncate(&schedule, 36),
+                    suspended,
+                    active
+                ))
+            }
+            _ => Ok("n/a".to_string()),
+        }
+    }
 }
 
 fn build_kube_targets(kubeconfig: &Kubeconfig) -> Vec<KubeTarget> {
@@ -2723,6 +3818,96 @@ fn parse_memory_bytes(value: &str) -> Option<u64> {
 
 fn list_params() -> ListParams {
     ListParams::default().limit(500)
+}
+
+fn resolve_namespace_target(namespace: Option<&str>, fallback: &str) -> Result<String> {
+    let namespace = namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if fallback.trim().is_empty() {
+                None
+            } else {
+                Some(fallback.to_string())
+            }
+        });
+    namespace.context("namespace target is required")
+}
+
+fn selector_query(selector: &BTreeMap<String, String>) -> String {
+    selector
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn service_selector_matches_labels(service: &Service, labels: &BTreeMap<String, String>) -> bool {
+    let Some(selector) = service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.selector.as_ref())
+    else {
+        return false;
+    };
+    if selector.is_empty() || labels.is_empty() {
+        return false;
+    }
+    selector
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn service_ports_summary(service: &Service) -> String {
+    let ports = service
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.ports.clone())
+        .unwrap_or_default();
+    if ports.is_empty() {
+        return "-".to_string();
+    }
+
+    ports
+        .into_iter()
+        .map(|port| {
+            let protocol = port.protocol.unwrap_or_else(|| "TCP".to_string());
+            format!("{}/{}", port.port, protocol)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn format_cpu_millicores(value: u64) -> String {
+    if value >= 1_000 {
+        let cores = value as f64 / 1_000.0;
+        format!("{cores:.2}c")
+    } else {
+        format!("{value}m")
+    }
+}
+
+fn format_bytes(value: u64) -> String {
+    const UNITS: [(&str, f64); 6] = [
+        ("Ei", 1_152_921_504_606_846_976.0),
+        ("Pi", 1_125_899_906_842_624.0),
+        ("Ti", 1_099_511_627_776.0),
+        ("Gi", 1_073_741_824.0),
+        ("Mi", 1_048_576.0),
+        ("Ki", 1_024.0),
+    ];
+    if value == 0 {
+        return "0B".to_string();
+    }
+
+    let value_f64 = value as f64;
+    for (suffix, unit_size) in UNITS {
+        if value_f64 >= unit_size {
+            return format!("{:.1}{suffix}", value_f64 / unit_size);
+        }
+    }
+    format!("{value}B")
 }
 
 fn pod_readiness(status: &k8s_openapi::api::core::v1::PodStatus) -> (usize, usize, i32) {

@@ -118,8 +118,14 @@ pub enum AppCommand {
         user: String,
     },
     InspectTooling,
+    InspectPulses,
     InspectOps {
         target: OpsInspectTarget,
+    },
+    InspectXray {
+        tab: ResourceTab,
+        namespace: Option<String>,
+        name: String,
     },
 }
 
@@ -1637,6 +1643,8 @@ impl App {
             "help".to_string(),
             "ops".to_string(),
             "tools".to_string(),
+            "pulses".to_string(),
+            "xray".to_string(),
             "argocd".to_string(),
             "argocd ".to_string(),
             "helm".to_string(),
@@ -1725,6 +1733,8 @@ impl App {
         let mut candidates = vec![
             "ops".to_string(),
             "tools".to_string(),
+            "pulses".to_string(),
+            "xray".to_string(),
             "argocd".to_string(),
             "helm".to_string(),
             "tf".to_string(),
@@ -2049,6 +2059,8 @@ impl App {
             }
             "ops" => AppCommand::InspectTooling,
             "tools" => AppCommand::InspectTooling,
+            "pulses" | "pulse" => AppCommand::InspectPulses,
+            "xray" | "xr" | "x" => self.prepare_xray_command(parts.next()),
             "argocd" | "argo" => {
                 if let Some(name) = parts.next() {
                     AppCommand::InspectOps {
@@ -2255,6 +2267,14 @@ impl App {
 
         if first == "tools" {
             return AppCommand::InspectTooling;
+        }
+
+        if matches!(first.as_str(), "pulses" | "pulse") {
+            return AppCommand::InspectPulses;
+        }
+
+        if matches!(first.as_str(), "xray" | "xr" | "x") {
+            return self.prepare_xray_command(parts.next());
         }
 
         if matches!(first.as_str(), "argocd" | "argo") {
@@ -2804,6 +2824,71 @@ impl App {
         }
     }
 
+    fn prepare_xray_command(&mut self, raw_target: Option<&str>) -> AppCommand {
+        let tab = self.active_tab();
+        if !supports_xray(tab) {
+            self.status = format!("Xray is not supported for {}", tab.title());
+            return AppCommand::None;
+        }
+
+        let (mut namespace, name) = if let Some(raw_target) = raw_target {
+            if let Some((target_namespace, target_name)) = parse_namespaced_target(raw_target) {
+                (Some(target_namespace.to_string()), target_name)
+            } else {
+                (None, raw_target.trim().to_string())
+            }
+        } else {
+            let Some(selected) = self.active_selected_row() else {
+                self.status = "No selected resource for xray".to_string();
+                return AppCommand::None;
+            };
+            (selected.namespace.clone(), selected.name.clone())
+        };
+
+        if name.is_empty() {
+            self.status = "Usage: :xray [namespace/name|name]".to_string();
+            return AppCommand::None;
+        }
+
+        let namespaced = self
+            .kubectl_resource_for_tab(tab)
+            .map(|(_, namespaced)| namespaced)
+            .unwrap_or(matches!(
+                tab,
+                ResourceTab::Pods
+                    | ResourceTab::CronJobs
+                    | ResourceTab::DaemonSets
+                    | ResourceTab::Deployments
+                    | ResourceTab::ReplicaSets
+                    | ResourceTab::ReplicationControllers
+                    | ResourceTab::StatefulSets
+                    | ResourceTab::Jobs
+                    | ResourceTab::Services
+                    | ResourceTab::Events
+            ));
+        if namespaced && namespace.is_none() {
+            namespace = match self.namespace_scope() {
+                NamespaceScope::Named(namespace) => Some(namespace.clone()),
+                NamespaceScope::All => None,
+            };
+        }
+        if namespaced && namespace.is_none() {
+            self.status =
+                "Xray needs a namespace target (select a row or use :xray <ns>/<name>)".to_string();
+            return AppCommand::None;
+        }
+
+        self.status = match namespace.as_deref() {
+            Some(namespace) => format!("Building xray for {} {namespace}/{name}", tab.title()),
+            None => format!("Building xray for {} {name}", tab.title()),
+        };
+        AppCommand::InspectXray {
+            tab,
+            namespace,
+            name,
+        }
+    }
+
     fn kubectl_resource_for_tab(&self, tab: ResourceTab) -> Option<(String, bool)> {
         match tab {
             ResourceTab::Pods => Some(("pod".to_string(), true)),
@@ -3104,6 +3189,11 @@ fn is_known_command_token(token: &str) -> bool {
         "q" | "quit"
             | "exit"
             | "ops"
+            | "pulses"
+            | "pulse"
+            | "xray"
+            | "xr"
+            | "x"
             | "argocd"
             | "argo"
             | "helm"
@@ -3172,6 +3262,23 @@ fn supports_related_logs(tab: ResourceTab) -> bool {
             | ResourceTab::Jobs
             | ResourceTab::CronJobs
             | ResourceTab::Services
+    )
+}
+
+fn supports_xray(tab: ResourceTab) -> bool {
+    matches!(
+        tab,
+        ResourceTab::Pods
+            | ResourceTab::CronJobs
+            | ResourceTab::DaemonSets
+            | ResourceTab::Deployments
+            | ResourceTab::ReplicaSets
+            | ResourceTab::ReplicationControllers
+            | ResourceTab::StatefulSets
+            | ResourceTab::Jobs
+            | ResourceTab::Services
+            | ResourceTab::Nodes
+            | ResourceTab::Namespaces
     )
 }
 
@@ -3382,6 +3489,61 @@ mod tests {
                 target: OpsInspectTarget::HelmRelease {
                     name: "my-release".to_string()
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn pulses_command_requests_pulses_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "pulses".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::InspectPulses);
+    }
+
+    #[test]
+    fn xray_command_uses_selected_resource() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut pods = TableData::default();
+        pods.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "api-123".to_string(),
+                namespace: Some("orca-sandbox".to_string()),
+                columns: vec!["api-123".to_string()],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Pods, pods);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
+
+        app.apply_action(Action::StartCommand);
+        for c in "xray".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectXray {
+                tab: ResourceTab::Pods,
+                namespace: Some("orca-sandbox".to_string()),
+                name: "api-123".to_string(),
             }
         );
     }

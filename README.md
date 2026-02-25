@@ -27,6 +27,7 @@
 - Pod/service port-forward management with live PF indicators
 - YAML/JSON syntax highlighting in details view
 - DevOps tool overlays for Argo CD, Helm, Terraform, Ansible, Docker, OpenShift, and Kustomize
+- Fleet pulse snapshot (`:pulses`) and resource relationship trace (`:xray`)
 
 ## Supported resources
 
@@ -163,6 +164,8 @@ Supported commands:
 - `:crd-refresh`
 - `:help`
 - `:ops`, `:tools`
+- `:pulses` (`:pulse`)
+- `:xray` (`:xr`, `:x`) on selected row (or explicit target)
 - `:argocd [app-name]`
 - `:helm [release]`
 - `:tf` (`:terraform`)
@@ -179,6 +182,7 @@ Compatibility command:
 
 - Supports the same context/cluster/user and resource aliases for fast navigation
 - Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>oc`, `>kustomize`)
+- Supports observability overlays (`>pulses`, `>xray`)
 - Supports namespaced targets (for example `>po my-ns/my-pod`)
 - Supports fuzzy jump by resource name/namespace when no explicit alias is provided
 - Resets to the current flow root before executing jump selection

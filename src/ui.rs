@@ -1647,6 +1647,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
             .to_string(),
     );
     lines.push("Ops: :tools  :argocd  :helm  :tf  :ansible  :docker  :oc  :kustomize".to_string());
+    lines.push("SRE: :pulses fleet snapshot  :xray selected-resource relations".to_string());
     lines.push("Input: : command  > jump  / filter  Tab autocomplete  Ctrl+u/d page".to_string());
     lines.push(String::new());
 
@@ -1691,7 +1692,10 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     ));
     lines.push(resource_tab_help(app.active_tab()));
     lines.push(resource_commands_help(app.active_tab()));
-    lines.push("Global ops: e edit  p port-forward  r refresh  ? close help  q quit".to_string());
+    lines.push(
+        "Global ops: e edit  p port-forward  r refresh  :pulses  :xray  ? close help  q quit"
+            .to_string(),
+    );
     lines
 }
 
