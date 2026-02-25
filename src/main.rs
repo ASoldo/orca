@@ -7,7 +7,7 @@ mod model;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, AppCommand, OpsInspectTarget, PluginRun};
+use app::{App, AppCommand, ArgoResourcePanelSection, OpsInspectTarget, PluginRun};
 use chrono::Local;
 use clap::Parser;
 use cli::CliArgs;
@@ -605,6 +605,54 @@ async fn execute_app_command(
                 };
                 app.set_detail_overlay(title, error.clone());
                 app.set_status(format!("Argo panel load failed: {error}"));
+            }
+        },
+        AppCommand::LoadArgoResourcePanelSection {
+            kind,
+            namespace,
+            name,
+            section,
+        } => match fetch_argocd_resource_panel_sections(&kind, namespace.as_deref(), &name).await {
+            Ok((title, sections)) => {
+                let (panel_title, panel_text) = match section {
+                    ArgoResourcePanelSection::Events => (
+                        format!("{title} Events"),
+                        format!("EVENTS\n{}", sections.events),
+                    ),
+                    ArgoResourcePanelSection::Manifest => (
+                        format!("{title} Manifest"),
+                        format!("LIVE MANIFEST\n{}", sections.manifest),
+                    ),
+                };
+                app.set_output_overlay(panel_title, panel_text);
+                app.set_status(match section {
+                    ArgoResourcePanelSection::Events => format!(
+                        "Loaded Argo events for {} {}/{}",
+                        kind,
+                        namespace.as_deref().unwrap_or("-"),
+                        name
+                    ),
+                    ArgoResourcePanelSection::Manifest => format!(
+                        "Loaded Argo manifest for {} {}/{}",
+                        kind,
+                        namespace.as_deref().unwrap_or("-"),
+                        name
+                    ),
+                });
+            }
+            Err(error) => {
+                let title = match namespace.as_deref() {
+                    Some(namespace) => format!("Argo {kind} {namespace}/{name}"),
+                    None => format!("Argo {kind} {name}"),
+                };
+                app.set_output_overlay(
+                    match section {
+                        ArgoResourcePanelSection::Events => format!("{title} Events"),
+                        ArgoResourcePanelSection::Manifest => format!("{title} Manifest"),
+                    },
+                    error.clone(),
+                );
+                app.set_status(format!("Argo section load failed: {error}"));
             }
         },
         AppCommand::DeleteSelected {
@@ -2512,6 +2560,25 @@ async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<Tab
         }
     }
 
+    fn tree_kind_label(kind: &str) -> String {
+        match kind.to_ascii_lowercase().as_str() {
+            "service" => "Service".to_string(),
+            "deployment" => "Deployment".to_string(),
+            "replicaset" => "ReplicaSe".to_string(),
+            "replicationcontroller" => "ReplCtrl".to_string(),
+            "statefulset" => "StatefulSe".to_string(),
+            "daemonset" => "DaemonSet".to_string(),
+            "job" => "Job".to_string(),
+            "cronjob" => "CronJob".to_string(),
+            "pod" => "Pod".to_string(),
+            "configmap" => "CfgMap".to_string(),
+            "secret" => "Secret".to_string(),
+            "namespace" => "Namespace".to_string(),
+            "node" => "Node".to_string(),
+            other => other.chars().take(10).collect::<String>(),
+        }
+    }
+
     fn rs_health(item: &Value) -> String {
         let replicas = item
             .pointer("/status/replicas")
@@ -2553,14 +2620,21 @@ async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<Tab
             return;
         };
 
-        let mut prefix = String::new();
-        for ancestor_is_last in ancestor_last {
-            prefix.push_str(if *ancestor_is_last { "   " } else { "│  " });
-        }
-        if !ancestor_last.is_empty() || node.parent.is_some() {
-            prefix.push_str(if is_last { "└─ " } else { "├─ " });
-        }
-        let tree_kind = format!("{prefix}{} {}", kind_icon(&node.kind), node.kind);
+        let depth = ancestor_last.len();
+        let prefix = if depth == 0 && node.parent.is_none() {
+            "  ".to_string()
+        } else {
+            format!(
+                "{}{}",
+                "  ".repeat(depth),
+                if is_last { "└─" } else { "├─" }
+            )
+        };
+        let tree_kind = format!(
+            "{prefix}{} {}",
+            kind_icon(&node.kind),
+            tree_kind_label(&node.kind)
+        );
         rows.push(RowData {
             name: format!("{}/{}", node.kind, node.name),
             namespace: Some(node.namespace.clone()),
@@ -2941,15 +3015,30 @@ fn kubectl_resource_token_for_kind(kind: &str) -> String {
 fn supports_argocd_logs(kind: &str) -> bool {
     matches!(
         kind.to_ascii_lowercase().as_str(),
-        "pod" | "deployment" | "replicaset" | "statefulset" | "daemonset" | "job" | "cronjob"
+        "pod"
+            | "deployment"
+            | "replicaset"
+            | "replicationcontroller"
+            | "statefulset"
+            | "daemonset"
+            | "job"
+            | "cronjob"
     )
 }
 
-async fn fetch_argocd_resource_panel(
+#[derive(Debug, Clone)]
+struct ArgoResourcePanelSections {
+    summary: String,
+    events: String,
+    logs: String,
+    manifest: String,
+}
+
+async fn fetch_argocd_resource_panel_sections(
     kind: &str,
     namespace: Option<&str>,
     name: &str,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<(String, ArgoResourcePanelSections), String> {
     let namespace = namespace
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "-")
@@ -3078,13 +3167,31 @@ async fn fetch_argocd_resource_panel(
         .map(|output| bounded_output(&output, 240, 220))
         .unwrap_or_else(|error| format!("Manifest unavailable: {error}"));
 
-    let panel = format!(
-        "SUMMARY\n{summary_block}\n\nEVENTS\n{events_block}\n\nLOGS\n{logs_block}\n\nLIVE MANIFEST\n{manifest_block}"
-    );
     let title = match namespace.as_deref() {
         Some(namespace) => format!("Argo {kind} {namespace}/{name}"),
         None => format!("Argo {kind} {name}"),
     };
+    Ok((
+        title,
+        ArgoResourcePanelSections {
+            summary: summary_block,
+            events: events_block,
+            logs: logs_block,
+            manifest: manifest_block,
+        },
+    ))
+}
+
+async fn fetch_argocd_resource_panel(
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+) -> std::result::Result<(String, String), String> {
+    let (title, sections) = fetch_argocd_resource_panel_sections(kind, namespace, name).await?;
+    let panel = format!(
+        "SUMMARY\n{}\n\nEVENTS\n{}\n\nLOGS\n{}\n\nLIVE MANIFEST\n{}",
+        sections.summary, sections.events, sections.logs, sections.manifest
+    );
     Ok((title, panel))
 }
 

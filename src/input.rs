@@ -24,6 +24,7 @@ pub enum Action {
     LoadResourceLogs,
     OpenPodShell,
     EditResource,
+    ShowManifest,
     StartPortForwardPrompt,
     ToggleOverview,
     ClearDetailOverlay,
@@ -86,6 +87,7 @@ fn map_normal_mode_key(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('L') => Some(Action::LoadResourceLogs),
         KeyCode::Char('s') => Some(Action::OpenPodShell),
         KeyCode::Char('e') => Some(Action::EditResource),
+        KeyCode::Char('m') if key.modifiers.is_empty() => Some(Action::ShowManifest),
         KeyCode::Char('p') => Some(Action::StartPortForwardPrompt),
         KeyCode::Char('o') => Some(Action::ToggleOverview),
         KeyCode::Char('d') if key.modifiers.is_empty() => Some(Action::ShowDetails),
@@ -362,6 +364,13 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
         let action = map_key(InputMode::Normal, key);
         assert_eq!(action, Some(Action::LoadResourceLogs));
+    }
+
+    #[test]
+    fn normal_mode_maps_m_to_manifest() {
+        let key = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+        let action = map_key(InputMode::Normal, key);
+        assert_eq!(action, Some(Action::ShowManifest));
     }
 
     #[test]

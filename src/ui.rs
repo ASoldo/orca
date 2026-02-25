@@ -2033,10 +2033,17 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     ));
     lines.push(resource_tab_help(app.active_tab()));
     lines.push(resource_commands_help(app.active_tab()));
-    lines.push(
-        "Global ops: e edit  p port-forward  r refresh  :pulses  :xray  ? close help  q quit"
-            .to_string(),
-    );
+    if app.active_tab() == ResourceTab::ArgoCdResources {
+        lines.push(
+            "Global ops: e events  l logs  m manifest  s shell (Pod)  r refresh  ? close help  q quit"
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Global ops: e edit  p port-forward  r refresh  :pulses  :xray  ? close help  q quit"
+                .to_string(),
+        );
+    }
     lines
 }
 
@@ -2046,7 +2053,7 @@ fn resource_tab_help(tab: ResourceTab) -> String {
             "Argo CD flow: Enter opens selected app resources  d shows app details".to_string()
         }
         ResourceTab::ArgoCdResources => {
-            "Argo CD resources: Enter opens summary/events/logs panel  d shows raw details"
+            "Argo CD resources: Enter full panel  e events  l logs  m live manifest  d raw details"
                 .to_string()
         }
         ResourceTab::ArgoCdProjects => {
@@ -2093,8 +2100,10 @@ fn resource_tab_help(tab: ResourceTab) -> String {
 
 fn resource_commands_help(tab: ResourceTab) -> String {
     match tab {
-        ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources => "Commands: :argocd [app]  :argocd resources  Enter panel  :argocd sync|refresh|diff|history|rollback|delete [app]"
-            .to_string(),
+        ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources => {
+            "Commands: :argocd [app]  :argocd resources  Enter panel  :argocd sync|refresh|diff|history|rollback|delete [app]"
+                .to_string()
+        }
         ResourceTab::ArgoCdProjects
         | ResourceTab::ArgoCdRepos
         | ResourceTab::ArgoCdClusters

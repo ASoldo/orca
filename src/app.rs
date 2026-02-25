@@ -35,6 +35,12 @@ pub enum TableOverlayKind {
     Shell,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgoResourcePanelSection {
+    Events,
+    Manifest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpsInspectTarget {
     ArgoCdSync {
@@ -155,6 +161,12 @@ pub enum AppCommand {
         namespace: Option<String>,
         name: String,
     },
+    LoadArgoResourcePanelSection {
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+        section: ArgoResourcePanelSection,
+    },
     DeleteSelected {
         tab: ResourceTab,
         namespace: Option<String>,
@@ -231,6 +243,13 @@ struct ContainerPickerState {
     pod_name: String,
     containers: Vec<ContainerPickerEntry>,
     selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ArgoResourceTarget {
+    kind: String,
+    namespace: Option<String>,
+    name: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1336,7 +1355,21 @@ impl App {
             Action::LoadPodLogs => self.create_logs_command(false),
             Action::LoadResourceLogs => self.create_related_logs_command(true),
             Action::OpenPodShell => self.prepare_shell_command(None, "auto".to_string()),
-            Action::EditResource => self.prepare_edit_command(),
+            Action::EditResource => {
+                if self.active_tab() == ResourceTab::ArgoCdResources {
+                    self.prepare_argocd_resource_section(ArgoResourcePanelSection::Events)
+                } else {
+                    self.prepare_edit_command()
+                }
+            }
+            Action::ShowManifest => {
+                if self.active_tab() == ResourceTab::ArgoCdResources {
+                    self.prepare_argocd_resource_section(ArgoResourcePanelSection::Manifest)
+                } else {
+                    self.status = "Manifest shortcut is available in Argo CD resources".to_string();
+                    AppCommand::None
+                }
+            }
             Action::StartPortForwardPrompt => {
                 self.mode = InputMode::Command;
                 self.input = "port-forward ".to_string();
@@ -2357,48 +2390,47 @@ impl App {
     }
 
     fn prepare_argocd_resource_panel(&mut self) -> AppCommand {
-        let Some(row) = self.active_selected_row() else {
+        let Some(target) = self.selected_argocd_resource_target() else {
             self.status = "No Argo CD resource selected".to_string();
             return AppCommand::None;
         };
 
-        let kind = row
-            .name
-            .split_once('/')
-            .map(|(kind, _)| kind.trim().to_string())
-            .or_else(|| row.columns.first().map(|value| value.trim().to_string()))
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "resource".to_string());
-
-        let name = row
-            .columns
-            .get(2)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                row.name
-                    .split_once('/')
-                    .map(|(_, name)| name.trim().to_string())
-            })
-            .unwrap_or_else(|| row.name.clone());
-
-        let namespace = row.namespace.clone().and_then(|namespace| {
-            let trimmed = namespace.trim();
-            if trimmed.is_empty() || trimmed == "-" {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-
-        self.status = match namespace.as_deref() {
-            Some(namespace) => format!("Loading Argo {} {namespace}/{}", kind, name),
-            None => format!("Loading Argo {} {}", kind, name),
+        self.status = match target.namespace.as_deref() {
+            Some(namespace) => format!("Loading Argo {} {namespace}/{}", target.kind, target.name),
+            None => format!("Loading Argo {} {}", target.kind, target.name),
         };
         AppCommand::LoadArgoResourcePanel {
-            kind,
-            namespace,
-            name,
+            kind: target.kind,
+            namespace: target.namespace,
+            name: target.name,
+        }
+    }
+
+    fn prepare_argocd_resource_section(&mut self, section: ArgoResourcePanelSection) -> AppCommand {
+        let Some(target) = self.selected_argocd_resource_target() else {
+            self.status = "No Argo CD resource selected".to_string();
+            return AppCommand::None;
+        };
+
+        let section_label = match section {
+            ArgoResourcePanelSection::Events => "events",
+            ArgoResourcePanelSection::Manifest => "manifest",
+        };
+        self.status = match target.namespace.as_deref() {
+            Some(namespace) => format!(
+                "Loading Argo {section_label} for {} {namespace}/{}",
+                target.kind, target.name
+            ),
+            None => format!(
+                "Loading Argo {section_label} for {} {}",
+                target.kind, target.name
+            ),
+        };
+        AppCommand::LoadArgoResourcePanelSection {
+            kind: target.kind,
+            namespace: target.namespace,
+            name: target.name,
+            section,
         }
     }
 
@@ -3931,12 +3963,31 @@ impl App {
     }
 
     fn selected_argocd_pod_target(&self) -> Option<(String, String)> {
+        let target = self.selected_argocd_resource_target()?;
+        if !target.kind.eq_ignore_ascii_case("pod") {
+            return None;
+        }
+        let namespace = target.namespace?;
+        Some((namespace, target.name))
+    }
+
+    fn selected_argocd_resource_target(&self) -> Option<ArgoResourceTarget> {
         if self.active_tab() != ResourceTab::ArgoCdResources {
             return None;
         }
         let row = self.active_selected_row()?;
         let (kind, fallback_name) = row.name.split_once('/')?;
-        if !kind.eq_ignore_ascii_case("pod") {
+        let kind = kind.trim();
+        if kind.is_empty() {
+            return None;
+        }
+        let name = row
+            .columns
+            .get(2)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "-")
+            .unwrap_or_else(|| fallback_name.trim().to_string());
+        if name.is_empty() {
             return None;
         }
         let namespace = row
@@ -3944,17 +3995,12 @@ impl App {
             .clone()
             .or_else(|| row.columns.get(1).cloned())
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty() && value != "-")?;
-        let pod_name = row
-            .columns
-            .get(2)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty() && value != "-")
-            .unwrap_or_else(|| fallback_name.trim().to_string());
-        if pod_name.is_empty() {
-            return None;
-        }
-        Some((namespace, pod_name))
+            .filter(|value| !value.is_empty() && value != "-");
+        Some(ArgoResourceTarget {
+            kind: kind.to_string(),
+            namespace,
+            name,
+        })
     }
 
     fn prepare_edit_command(&mut self) -> AppCommand {
@@ -4160,8 +4206,18 @@ impl App {
             return self.load_selected_container_logs(previous);
         }
 
-        if self.active_tab() != ResourceTab::Pods {
-            if let Some((namespace, pod_name)) = self.selected_argocd_pod_target() {
+        if self.active_tab() == ResourceTab::ArgoCdResources {
+            let Some(target) = self.selected_argocd_resource_target() else {
+                self.status = "No Argo CD resource selected".to_string();
+                return AppCommand::None;
+            };
+
+            if target.kind.eq_ignore_ascii_case("pod") {
+                let Some(namespace) = target.namespace else {
+                    self.status = "Selected Argo Pod has no namespace".to_string();
+                    return AppCommand::None;
+                };
+                let pod_name = target.name;
                 self.status = if previous {
                     format!("Fetching previous logs for pod '{pod_name}' in '{namespace}'")
                 } else {
@@ -4174,6 +4230,27 @@ impl App {
                     previous,
                 };
             }
+            if let Some(tab) = argocd_logs_tab_for_kind(&target.kind) {
+                self.status = if previous {
+                    format!(
+                        "Resolving previous logs for {} '{}'",
+                        target.kind, target.name
+                    )
+                } else {
+                    format!("Resolving logs for {} '{}'", target.kind, target.name)
+                };
+                return AppCommand::LoadResourceLogs {
+                    tab,
+                    namespace: target.namespace,
+                    name: target.name,
+                    previous,
+                };
+            }
+            self.status = format!("Logs are not available for Argo kind '{}'", target.kind);
+            return AppCommand::None;
+        }
+
+        if self.active_tab() != ResourceTab::Pods {
             self.status =
                 "Logs are available from Pods (or use Shift+L for workload logs)".to_string();
             return AppCommand::None;
@@ -4218,6 +4295,9 @@ impl App {
         }
 
         let tab = self.active_tab();
+        if tab == ResourceTab::ArgoCdResources {
+            return self.create_logs_command(previous);
+        }
         if tab == ResourceTab::Pods {
             return self.create_logs_command(previous);
         }
@@ -4480,6 +4560,19 @@ fn supports_related_logs(tab: ResourceTab) -> bool {
     )
 }
 
+fn argocd_logs_tab_for_kind(kind: &str) -> Option<ResourceTab> {
+    match kind.to_ascii_lowercase().as_str() {
+        "deployment" => Some(ResourceTab::Deployments),
+        "daemonset" => Some(ResourceTab::DaemonSets),
+        "statefulset" => Some(ResourceTab::StatefulSets),
+        "replicaset" => Some(ResourceTab::ReplicaSets),
+        "replicationcontroller" => Some(ResourceTab::ReplicationControllers),
+        "job" => Some(ResourceTab::Jobs),
+        "cronjob" => Some(ResourceTab::CronJobs),
+        _ => None,
+    }
+}
+
 fn supports_xray(tab: ResourceTab) -> bool {
     matches!(
         tab,
@@ -4638,8 +4731,9 @@ fn normalize_status_text(status: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppCommand, DetailPaneMode, HotkeyCommandDef, OpsInspectTarget, PluginCommandDef,
-        PluginRun, normalize_mode_prefixed_input, normalize_status_text,
+        App, AppCommand, ArgoResourcePanelSection, DetailPaneMode, HotkeyCommandDef,
+        OpsInspectTarget, PluginCommandDef, PluginRun, normalize_mode_prefixed_input,
+        normalize_status_text,
     };
     use crate::input::Action;
     use crate::model::{ContextCatalogRow, NamespaceScope, ResourceTab, RowData, TableData};
@@ -4845,6 +4939,132 @@ mod tests {
                 pod_name: "guestbook-ui-6595f948db-abcde".to_string(),
                 container: None,
                 previous: false,
+            }
+        );
+    }
+
+    #[test]
+    fn load_logs_from_argocd_deployment_node_targets_workload_logs() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut resources = TableData::default();
+        resources.set_rows(
+            vec![
+                "Tree".to_string(),
+                "Namespace".to_string(),
+                "Name".to_string(),
+            ],
+            vec![RowData {
+                name: "Deployment/guestbook-ui".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                columns: vec![
+                    "󰹑 Deployment".to_string(),
+                    "argocd-demo".to_string(),
+                    "guestbook-ui".to_string(),
+                ],
+                detail: "kind: Deployment".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdResources, resources);
+        app.switch_to_tab(ResourceTab::ArgoCdResources);
+
+        let cmd = app.apply_action(Action::LoadPodLogs);
+        assert_eq!(
+            cmd,
+            AppCommand::LoadResourceLogs {
+                tab: ResourceTab::Deployments,
+                namespace: Some("argocd-demo".to_string()),
+                name: "guestbook-ui".to_string(),
+                previous: false,
+            }
+        );
+    }
+
+    #[test]
+    fn edit_on_argocd_resource_opens_events_section() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut resources = TableData::default();
+        resources.set_rows(
+            vec![
+                "Tree".to_string(),
+                "Namespace".to_string(),
+                "Name".to_string(),
+            ],
+            vec![RowData {
+                name: "ReplicaSet/guestbook-ui-6595f948db".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                columns: vec![
+                    "└─󰹍 ReplicaSe".to_string(),
+                    "argocd-demo".to_string(),
+                    "guestbook-ui-6595f948db".to_string(),
+                ],
+                detail: "kind: ReplicaSet".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdResources, resources);
+        app.switch_to_tab(ResourceTab::ArgoCdResources);
+
+        let cmd = app.apply_action(Action::EditResource);
+        assert_eq!(
+            cmd,
+            AppCommand::LoadArgoResourcePanelSection {
+                kind: "ReplicaSet".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                name: "guestbook-ui-6595f948db".to_string(),
+                section: ArgoResourcePanelSection::Events,
+            }
+        );
+    }
+
+    #[test]
+    fn m_on_argocd_resource_opens_manifest_section() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut resources = TableData::default();
+        resources.set_rows(
+            vec![
+                "Tree".to_string(),
+                "Namespace".to_string(),
+                "Name".to_string(),
+            ],
+            vec![RowData {
+                name: "Service/guestbook-ui".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                columns: vec![
+                    "󰒓 Service".to_string(),
+                    "argocd-demo".to_string(),
+                    "guestbook-ui".to_string(),
+                ],
+                detail: "kind: Service".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdResources, resources);
+        app.switch_to_tab(ResourceTab::ArgoCdResources);
+
+        let cmd = app.apply_action(Action::ShowManifest);
+        assert_eq!(
+            cmd,
+            AppCommand::LoadArgoResourcePanelSection {
+                kind: "Service".to_string(),
+                namespace: Some("argocd-demo".to_string()),
+                name: "guestbook-ui".to_string(),
+                section: ArgoResourcePanelSection::Manifest,
             }
         );
     }
