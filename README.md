@@ -171,6 +171,7 @@ Supported commands:
 - `:tf` (`:terraform`)
 - `:ansible` (`:ans`)
 - `:docker`
+- `:rbac [subject]` (uses `kubectl auth can-i --list`, optional `--as`)
 - `:oc` (`:openshift`)
 - `:kustomize [path]`
 
@@ -181,7 +182,7 @@ Compatibility command:
 ## Jump mode (`>`)
 
 - Supports the same context/cluster/user and resource aliases for fast navigation
-- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>oc`, `>kustomize`)
+- Supports DevOps overlays (`>tools`, `>argocd`, `>helm`, `>tf`, `>ansible`, `>docker`, `>rbac`, `>oc`, `>kustomize`)
 - Supports observability overlays (`>pulses`, `>xray`)
 - Supports namespaced targets (for example `>po my-ns/my-pod`)
 - Supports fuzzy jump by resource name/namespace when no explicit alias is provided

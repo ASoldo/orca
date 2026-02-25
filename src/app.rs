@@ -45,6 +45,7 @@ pub enum OpsInspectTarget {
     DockerOverview,
     OpenShiftProjects,
     KustomizeBuild { path: String },
+    RbacMatrix { subject: Option<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1653,6 +1654,8 @@ impl App {
             "terraform".to_string(),
             "ansible".to_string(),
             "docker".to_string(),
+            "rbac".to_string(),
+            "rbac ".to_string(),
             "oc".to_string(),
             "openshift".to_string(),
             "kustomize".to_string(),
@@ -1740,6 +1743,7 @@ impl App {
             "tf".to_string(),
             "ansible".to_string(),
             "docker".to_string(),
+            "rbac".to_string(),
             "oc".to_string(),
             "kustomize .".to_string(),
             "ctx ".to_string(),
@@ -2096,6 +2100,11 @@ impl App {
             "docker" => AppCommand::InspectOps {
                 target: OpsInspectTarget::DockerOverview,
             },
+            "rbac" => AppCommand::InspectOps {
+                target: OpsInspectTarget::RbacMatrix {
+                    subject: parts.next().map(str::to_string),
+                },
+            },
             "oc" | "openshift" => AppCommand::InspectOps {
                 target: OpsInspectTarget::OpenShiftProjects,
             },
@@ -2320,6 +2329,14 @@ impl App {
         if first == "docker" {
             return AppCommand::InspectOps {
                 target: OpsInspectTarget::DockerOverview,
+            };
+        }
+
+        if first == "rbac" {
+            return AppCommand::InspectOps {
+                target: OpsInspectTarget::RbacMatrix {
+                    subject: parts.next().map(str::to_string),
+                },
             };
         }
 
@@ -3202,6 +3219,7 @@ fn is_known_command_token(token: &str) -> bool {
             | "ansible"
             | "ans"
             | "docker"
+            | "rbac"
             | "oc"
             | "openshift"
             | "kustomize"
@@ -3489,6 +3507,28 @@ mod tests {
                 target: OpsInspectTarget::HelmRelease {
                     name: "my-release".to_string()
                 }
+            }
+        );
+    }
+
+    #[test]
+    fn rbac_command_requests_rbac_overlay() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "rbac".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(
+            cmd,
+            AppCommand::InspectOps {
+                target: OpsInspectTarget::RbacMatrix { subject: None }
             }
         );
     }

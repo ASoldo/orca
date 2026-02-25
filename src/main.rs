@@ -1115,6 +1115,35 @@ async fn inspect_ops_target(
                 "Docker overview loaded".to_string(),
             )
         }
+        OpsInspectTarget::RbacMatrix { subject } => {
+            let mut args = vec![
+                "auth".to_string(),
+                "can-i".to_string(),
+                "--list".to_string(),
+            ];
+            if let NamespaceScope::Named(namespace) = namespace_scope {
+                args.push("-n".to_string());
+                args.push(namespace.clone());
+            }
+            if let Some(subject) = subject.as_ref() {
+                args.push("--as".to_string());
+                args.push(subject.clone());
+            }
+
+            let title = match subject.as_ref() {
+                Some(subject) => format!("RBAC Matrix {}", subject),
+                None => "RBAC Matrix".to_string(),
+            };
+
+            match run_external_readonly("kubectl", &args, 8).await {
+                Ok(output) => (
+                    title,
+                    bounded_output(&output, 260, 220),
+                    "RBAC matrix loaded".to_string(),
+                ),
+                Err(error) => (title, error, "RBAC matrix failed".to_string()),
+            }
+        }
         OpsInspectTarget::OpenShiftProjects => {
             let current = match run_external_readonly("oc", &["project".to_string()], 6).await {
                 Ok(output) => format!("current\n{}", bounded_output(&output, 18, 220)),
