@@ -368,7 +368,7 @@ impl App {
         let tabs = ResourceTab::ALL.to_vec();
         let initial_tab_index = tabs
             .iter()
-            .position(|tab| *tab == ResourceTab::Pods)
+            .position(|tab| *tab == ResourceTab::Orca)
             .unwrap_or(0);
         let tables = tabs
             .iter()
@@ -988,6 +988,32 @@ impl App {
         }
         let index = table.selected.min(visible_rows.len().saturating_sub(1));
         visible_rows.get(index).map(|row| row.name.clone())
+    }
+
+    pub fn table_row_count_for(&self, tab: ResourceTab) -> usize {
+        self.tables
+            .get(&tab)
+            .map(|table| table.rows.len())
+            .unwrap_or(0)
+    }
+
+    pub fn table_has_error_for(&self, tab: ResourceTab) -> bool {
+        self.tables
+            .get(&tab)
+            .and_then(|table| table.error.as_ref())
+            .is_some()
+    }
+
+    pub fn kube_context_count(&self) -> usize {
+        self.available_contexts.len()
+    }
+
+    pub fn kube_cluster_count(&self) -> usize {
+        self.available_clusters.len()
+    }
+
+    pub fn kube_user_count(&self) -> usize {
+        self.available_users.len()
     }
 
     pub fn register_port_forward(
@@ -1965,6 +1991,7 @@ impl App {
 
     fn command_completions(&self) -> Vec<String> {
         let mut candidates = vec![
+            "orca".to_string(),
             "help".to_string(),
             "readonly".to_string(),
             "readonly on".to_string(),
@@ -1993,6 +2020,12 @@ impl App {
             "argocd history ".to_string(),
             "argocd rollback ".to_string(),
             "argocd delete ".to_string(),
+            "k8s".to_string(),
+            "kube".to_string(),
+            "kubernetes".to_string(),
+            "k8s ".to_string(),
+            "kube ".to_string(),
+            "kubernetes ".to_string(),
             "helm".to_string(),
             "helm ".to_string(),
             "tf".to_string(),
@@ -2114,6 +2147,7 @@ impl App {
 
     fn jump_completions(&self) -> Vec<String> {
         let mut candidates = vec![
+            "orca".to_string(),
             "ops".to_string(),
             "readonly".to_string(),
             "config".to_string(),
@@ -2131,6 +2165,9 @@ impl App {
             "argocd accounts".to_string(),
             "argocd certs".to_string(),
             "argocd gpg".to_string(),
+            "k8s".to_string(),
+            "kube".to_string(),
+            "kubernetes".to_string(),
             "helm".to_string(),
             "tf".to_string(),
             "ansible".to_string(),
@@ -2305,6 +2342,7 @@ impl App {
         let row_name = row.name.clone();
         let row_namespace = row.namespace.clone();
         match tab {
+            ResourceTab::Orca => self.enter_orca_node(&row_name),
             ResourceTab::Namespaces => {
                 self.push_flow_state();
                 let namespace = row_name;
@@ -2384,6 +2422,58 @@ impl App {
                     "No enter drill-down for {} (press d for details)",
                     tab.title()
                 );
+                AppCommand::None
+            }
+        }
+    }
+
+    fn enter_orca_node(&mut self, node: &str) -> AppCommand {
+        match node {
+            "orca" => {
+                self.status = "ORCA control graph root".to_string();
+                AppCommand::None
+            }
+            "k8s" => self.open_kubernetes_command(Vec::new()),
+            "k8s/clusters" => {
+                self.show_cluster_catalog_overlay();
+                AppCommand::None
+            }
+            "k8s/contexts" => {
+                self.show_context_catalog_overlay();
+                AppCommand::None
+            }
+            "k8s/users" => {
+                self.show_user_catalog_overlay();
+                AppCommand::None
+            }
+            "k8s/namespaces" => self.switch_to_tab(ResourceTab::Namespaces),
+            "k8s/nodes" => self.switch_to_tab(ResourceTab::Nodes),
+            "k8s/pods" => self.switch_to_tab(ResourceTab::Pods),
+            "argocd" | "argocd/apps" => self.open_argocd_command(vec!["apps".to_string()]),
+            "argocd/resources" => self.open_argocd_command(vec!["resources".to_string()]),
+            "services" => {
+                self.status = "Select a concrete service node".to_string();
+                AppCommand::None
+            }
+            "service/helm" => AppCommand::InspectOps {
+                target: OpsInspectTarget::HelmReleases,
+            },
+            "service/terraform" => AppCommand::InspectOps {
+                target: OpsInspectTarget::TerraformOverview,
+            },
+            "service/ansible" => AppCommand::InspectOps {
+                target: OpsInspectTarget::AnsibleOverview,
+            },
+            "service/docker" => AppCommand::InspectOps {
+                target: OpsInspectTarget::DockerOverview,
+            },
+            "service/git" => AppCommand::InspectOps {
+                target: OpsInspectTarget::GitCatalog,
+            },
+            "service/argocd" => self.open_argocd_command(vec!["apps".to_string()]),
+            "service/crd" => self.switch_to_tab(ResourceTab::CustomResources),
+            _ => {
+                self.status = format!("No ORCA drill-down for '{node}'");
                 AppCommand::None
             }
         }
@@ -2582,9 +2672,14 @@ impl App {
             "alerts" | "alert" => AppCommand::InspectAlerts,
             "pulses" | "pulse" => AppCommand::InspectPulses,
             "xray" | "xr" | "x" => self.prepare_xray_command(parts.next()),
+            "orca" => self.switch_to_tab(ResourceTab::Orca),
             "argocd" | "argo" => {
                 let args = parts.map(str::to_string).collect::<Vec<_>>();
                 self.open_argocd_command(args)
+            }
+            "k8s" | "kube" | "kubernetes" => {
+                let args = parts.map(str::to_string).collect::<Vec<_>>();
+                self.open_kubernetes_command(args)
             }
             "helm" => {
                 if let Some(name) = parts.next() {
@@ -2841,8 +2936,16 @@ impl App {
             return self.prepare_xray_command(parts.next());
         }
 
+        if first == "orca" {
+            return self.switch_to_tab(ResourceTab::Orca);
+        }
+
         if matches!(first.as_str(), "argocd" | "argo") {
             return self.open_argocd_command(parts.map(str::to_string).collect::<Vec<_>>());
+        }
+
+        if matches!(first.as_str(), "k8s" | "kube" | "kubernetes") {
+            return self.open_kubernetes_command(parts.map(str::to_string).collect::<Vec<_>>());
         }
 
         if first == "helm" {
@@ -3435,6 +3538,46 @@ impl App {
             .replace("{scope}", &namespace_scope)
             .replace("{all_namespaces}", &all_ns)
             .replace("{args}", &joined_extra)
+    }
+
+    fn open_kubernetes_command(&mut self, args: Vec<String>) -> AppCommand {
+        if args.is_empty() {
+            let command = self.switch_to_tab(ResourceTab::Pods);
+            self.status = "Kubernetes workspace".to_string();
+            return if command == AppCommand::None {
+                AppCommand::RefreshActive
+            } else {
+                command
+            };
+        }
+
+        let target = resolve_command_token(&args[0]);
+        let Some(tab) = ResourceTab::from_token(&target) else {
+            self.status = format!("Unknown Kubernetes target '{}'", args[0]);
+            return AppCommand::None;
+        };
+        if matches!(
+            tab,
+            ResourceTab::Orca
+                | ResourceTab::ArgoCdApps
+                | ResourceTab::ArgoCdResources
+                | ResourceTab::ArgoCdProjects
+                | ResourceTab::ArgoCdRepos
+                | ResourceTab::ArgoCdClusters
+                | ResourceTab::ArgoCdAccounts
+                | ResourceTab::ArgoCdCerts
+                | ResourceTab::ArgoCdGpgKeys
+        ) {
+            self.status = format!("'{}' is not a Kubernetes resource tab", args[0]);
+            return AppCommand::None;
+        }
+
+        let remainder = if args.len() > 1 {
+            args[1..].join(" ")
+        } else {
+            String::new()
+        };
+        self.handle_tab_shortcut(tab, &remainder)
     }
 
     fn open_argocd_command(&mut self, args: Vec<String>) -> AppCommand {
@@ -4121,6 +4264,7 @@ impl App {
 
     fn kubectl_resource_for_tab(&self, tab: ResourceTab) -> Option<(String, bool)> {
         match tab {
+            ResourceTab::Orca => None,
             ResourceTab::ArgoCdApps => Some(("applications.argoproj.io".to_string(), true)),
             ResourceTab::ArgoCdResources
             | ResourceTab::ArgoCdProjects
@@ -4488,8 +4632,12 @@ fn is_known_command_token(token: &str) -> bool {
             | "xray"
             | "xr"
             | "x"
+            | "orca"
             | "argocd"
             | "argo"
+            | "k8s"
+            | "kube"
+            | "kubernetes"
             | "helm"
             | "tf"
             | "terraform"
@@ -4844,6 +4992,49 @@ mod tests {
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::RefreshActive);
         assert_eq!(app.active_tab(), ResourceTab::ArgoCdApps);
+    }
+
+    #[test]
+    fn app_starts_in_orca_tab() {
+        let app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        assert_eq!(app.active_tab(), ResourceTab::Orca);
+    }
+
+    #[test]
+    fn k8s_command_switches_to_pods_tab() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.apply_action(Action::StartCommand);
+        for c in "k8s".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_tab(), ResourceTab::Pods);
+    }
+
+    #[test]
+    fn orca_command_switches_to_orca_tab() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let _ = app.switch_to_tab(ResourceTab::Pods);
+        app.apply_action(Action::StartCommand);
+        for c in "orca".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
+        assert_eq!(app.active_tab(), ResourceTab::Orca);
     }
 
     #[test]
@@ -5309,6 +5500,8 @@ mod tests {
         );
         app.set_active_table_data(ResourceTab::Pods, pods);
         let _ = app.switch_to_tab(ResourceTab::Pods);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
 
         app.apply_action(Action::StartCommand);
         for c in "xray".chars() {
@@ -5417,6 +5610,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, pods);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
 
         let plugin = PluginCommandDef {
             name: "diag".to_string(),
@@ -5950,6 +6144,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, data);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
 
         let cmd = app.apply_action(Action::EnterResource);
         assert_eq!(
@@ -5981,6 +6176,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, data);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
 
         let _ = app.apply_action(Action::ShowDetails);
         assert_eq!(app.detail_mode(), DetailPaneMode::Details);
@@ -6011,6 +6207,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, data);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
         app.set_container_picker(
             "default",
             "pod-1",
@@ -6193,6 +6390,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, data);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
         app.set_detail_overlay("Pod Logs", "line".to_string());
         let _ = app.apply_action(Action::ToggleFocus);
         let _ = app.apply_action(Action::Down);
@@ -6222,6 +6420,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, data);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
 
         let _ = app.apply_action(Action::NextTab);
         let _ = app.apply_action(Action::PrevTab);
@@ -6356,6 +6555,7 @@ mod tests {
             now,
         );
         app.set_active_table_data(ResourceTab::Pods, initial);
+        let _ = app.switch_to_tab(ResourceTab::Pods);
         let _ = app.apply_action(Action::Down);
         let _ = app.apply_action(Action::Down);
         assert_eq!(app.active_selected_index(), Some(2));

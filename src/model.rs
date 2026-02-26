@@ -4,6 +4,7 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ResourceTab {
+    Orca,
     ArgoCdApps,
     ArgoCdResources,
     ArgoCdProjects,
@@ -41,7 +42,8 @@ pub enum ResourceTab {
 }
 
 impl ResourceTab {
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 35] = [
+        Self::Orca,
         Self::ArgoCdApps,
         Self::ArgoCdResources,
         Self::ArgoCdProjects,
@@ -80,6 +82,7 @@ impl ResourceTab {
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::Orca => "ORCA",
             Self::ArgoCdApps => "ArgoApps",
             Self::ArgoCdResources => "ArgoResources",
             Self::ArgoCdProjects => "ArgoProjects",
@@ -119,6 +122,7 @@ impl ResourceTab {
 
     pub fn from_token(token: &str) -> Option<Self> {
         match token.to_ascii_lowercase().as_str() {
+            "orca" | "home" | "dashboard" => Some(Self::Orca),
             "argo" | "argocd" | "argoapps" | "argocdapps" | "argocd-apps" => Some(Self::ArgoCdApps),
             "argores" | "argocdres" | "argoresources" | "argocdresources" | "argocd-resources" => {
                 Some(Self::ArgoCdResources)
@@ -200,6 +204,7 @@ impl ResourceTab {
 
     pub fn short_token(self) -> &'static str {
         match self {
+            Self::Orca => "orca",
             Self::ArgoCdApps => "argo",
             Self::ArgoCdResources => "argores",
             Self::ArgoCdProjects => "argoproj",
@@ -384,6 +389,7 @@ mod tests {
 
     #[test]
     fn resource_aliases_map_to_expected_tabs() {
+        assert_eq!(ResourceTab::from_token("orca"), Some(ResourceTab::Orca));
         assert_eq!(ResourceTab::from_token("cj"), Some(ResourceTab::CronJobs));
         assert_eq!(
             ResourceTab::from_token("daemonsets"),

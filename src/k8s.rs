@@ -257,7 +257,8 @@ impl KubeGateway {
     ) -> Result<TableData> {
         let refreshed_at = Local::now();
         let (headers, mut rows) = match tab {
-            ResourceTab::ArgoCdApps
+            ResourceTab::Orca
+            | ResourceTab::ArgoCdApps
             | ResourceTab::ArgoCdResources
             | ResourceTab::ArgoCdProjects
             | ResourceTab::ArgoCdRepos
@@ -718,6 +719,7 @@ impl KubeGateway {
             }
             ResourceTab::Events
             | ResourceTab::CustomResources
+            | ResourceTab::Orca
             | ResourceTab::ArgoCdApps
             | ResourceTab::ArgoCdResources
             | ResourceTab::ArgoCdProjects

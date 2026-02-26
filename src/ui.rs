@@ -811,6 +811,20 @@ fn format_cpu_millicores(value: u64) -> String {
 
 fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
     match tab {
+        ResourceTab::Orca => row
+            .columns
+            .get(3)
+            .map(|value| value.to_ascii_lowercase())
+            .map(|state| {
+                if state.contains("ok") || state.contains("ready") || state.contains("online") {
+                    100
+                } else if state.contains("warn") || state.contains("mapped") {
+                    60
+                } else {
+                    35
+                }
+            })
+            .unwrap_or(70),
         ResourceTab::ArgoCdApps => {
             let sync = row
                 .columns
@@ -1099,6 +1113,12 @@ fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
 
 fn selected_metric_line(tab: ResourceTab, row: &RowData) -> String {
     match tab {
+        ResourceTab::Orca => format!(
+            "domain:{} count:{} state:{}",
+            row.columns.get(1).map_or("-", String::as_str),
+            row.columns.get(2).map_or("-", String::as_str),
+            row.columns.get(3).map_or("-", String::as_str)
+        ),
         ResourceTab::ArgoCdApps => format!(
             "project:{} ns:{} sync:{} health:{}",
             row.columns.get(1).map_or("-", String::as_str),
@@ -2033,7 +2053,12 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     ));
     lines.push(resource_tab_help(app.active_tab()));
     lines.push(resource_commands_help(app.active_tab()));
-    if app.active_tab() == ResourceTab::ArgoCdResources {
+    if app.active_tab() == ResourceTab::Orca {
+        lines.push(
+            "Global ops: Enter drill-down  :orca  :k8s  :argocd  :tools  r refresh  ? close help  q quit"
+                .to_string(),
+        );
+    } else if app.active_tab() == ResourceTab::ArgoCdResources {
         lines.push(
             "Global ops: e events  l logs  m manifest  s shell (Pod)  r refresh  ? close help  q quit"
                 .to_string(),
@@ -2049,6 +2074,9 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
 
 fn resource_tab_help(tab: ResourceTab) -> String {
     match tab {
+        ResourceTab::Orca => {
+            "ORCA graph: Enter drills into k8s, argocd, and service nodes".to_string()
+        }
         ResourceTab::ArgoCdApps => {
             "Argo CD flow: Enter opens selected app resources  e edit app manifest  d details"
                 .to_string()
@@ -2101,6 +2129,10 @@ fn resource_tab_help(tab: ResourceTab) -> String {
 
 fn resource_commands_help(tab: ResourceTab) -> String {
     match tab {
+        ResourceTab::Orca => {
+            "Commands: :orca  :k8s [resource]  :argocd [app]  :tools  :alerts  :pulses"
+                .to_string()
+        }
         ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources => {
             "Commands: :argocd [app]  :argocd resources  Enter panel  :argocd sync|refresh|diff|history|rollback|delete [app]"
                 .to_string()
@@ -2181,6 +2213,7 @@ fn display_cluster_endpoint(cluster: &str) -> String {
 
 fn tab_icon(tab: ResourceTab) -> &'static str {
     match tab {
+        ResourceTab::Orca => "󰀵",
         ResourceTab::ArgoCdApps => "󰀶",
         ResourceTab::ArgoCdResources => "󰛀",
         ResourceTab::ArgoCdProjects => "󰠱",
@@ -2220,6 +2253,7 @@ fn tab_icon(tab: ResourceTab) -> &'static str {
 
 fn tab_group_label(tab: ResourceTab) -> &'static str {
     match tab {
+        ResourceTab::Orca => "orca",
         ResourceTab::ArgoCdApps
         | ResourceTab::ArgoCdResources
         | ResourceTab::ArgoCdProjects
@@ -2257,6 +2291,7 @@ fn tab_group_label(tab: ResourceTab) -> &'static str {
 
 fn tab_group_icon(tab: ResourceTab) -> &'static str {
     match tab_group_label(tab) {
+        "orca" => "󰀵",
         "argocd" => "󰀶",
         "workloads" => "󰙨",
         "service" => "󰒓",

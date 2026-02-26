@@ -232,8 +232,11 @@ async fn run_loop(
     }
 
     refresh_custom_resource_catalog(app, gateway).await;
-    refresh_tab(app, gateway, app.active_tab()).await;
     refresh_tab(app, gateway, ResourceTab::Namespaces).await;
+    refresh_tab(app, gateway, ResourceTab::Nodes).await;
+    refresh_tab(app, gateway, ResourceTab::Pods).await;
+    refresh_tab(app, gateway, ResourceTab::ArgoCdApps).await;
+    refresh_tab(app, gateway, app.active_tab()).await;
     refresh_tab(app, gateway, ResourceTab::CustomResources).await;
 
     let mut reader = EventStream::new();
@@ -2227,6 +2230,13 @@ fn discover_ansible_playbooks(root: &str, max_depth: usize, max_files: usize) ->
 }
 
 async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
+    if tab == ResourceTab::Orca {
+        let table = build_orca_dashboard_table(app);
+        app.set_active_table_data(tab, table);
+        app.set_status("ORCA control graph refreshed");
+        return;
+    }
+
     if matches!(
         tab,
         ResourceTab::ArgoCdApps
@@ -2299,6 +2309,291 @@ async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
             ));
         }
     }
+}
+
+fn build_orca_dashboard_table(app: &App) -> TableData {
+    let k8s_clusters = app.kube_cluster_count();
+    let k8s_contexts = app.kube_context_count();
+    let k8s_users = app.kube_user_count();
+    let ns_count = app.table_row_count_for(ResourceTab::Namespaces);
+    let node_count = app.table_row_count_for(ResourceTab::Nodes);
+    let pod_count = app.table_row_count_for(ResourceTab::Pods);
+    let crd_count = app.table_row_count_for(ResourceTab::CustomResources);
+    let argo_apps = app.table_row_count_for(ResourceTab::ArgoCdApps);
+    let argo_resources = app.table_row_count_for(ResourceTab::ArgoCdResources);
+    let argo_server = app.argocd_server();
+    let argo_state = if argo_server == "-" {
+        "disconnected"
+    } else {
+        "connected"
+    };
+
+    let rows = vec![
+        RowData {
+            name: "orca".to_string(),
+            namespace: None,
+            columns: vec![
+                "󰀵 ORCA".to_string(),
+                "platform".to_string(),
+                "1".to_string(),
+                "online".to_string(),
+            ],
+            detail: "ORCA unified control plane".to_string(),
+        },
+        RowData {
+            name: "k8s".to_string(),
+            namespace: None,
+            columns: vec![
+                "├─󱃾 Kubernetes".to_string(),
+                "fleet".to_string(),
+                k8s_clusters.max(1).to_string(),
+                if app.table_has_error_for(ResourceTab::Pods) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Kubernetes estates under ORCA control".to_string(),
+        },
+        RowData {
+            name: "k8s/clusters".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰠳 Clusters".to_string(),
+                "catalog".to_string(),
+                k8s_clusters.to_string(),
+                "ok".to_string(),
+            ],
+            detail: "Discovered Kubernetes clusters from kubeconfig".to_string(),
+        },
+        RowData {
+            name: "k8s/contexts".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰈄 Contexts".to_string(),
+                "catalog".to_string(),
+                k8s_contexts.to_string(),
+                "ok".to_string(),
+            ],
+            detail: "Discovered kube contexts".to_string(),
+        },
+        RowData {
+            name: "k8s/users".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰀉 Users".to_string(),
+                "catalog".to_string(),
+                k8s_users.to_string(),
+                "ok".to_string(),
+            ],
+            detail: "Discovered kube auth users".to_string(),
+        },
+        RowData {
+            name: "k8s/namespaces".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰉖 Namespaces".to_string(),
+                "runtime".to_string(),
+                ns_count.to_string(),
+                if app.table_has_error_for(ResourceTab::Namespaces) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Current namespace inventory".to_string(),
+        },
+        RowData {
+            name: "k8s/nodes".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰣇 Nodes".to_string(),
+                "runtime".to_string(),
+                node_count.to_string(),
+                if app.table_has_error_for(ResourceTab::Nodes) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Current node inventory".to_string(),
+        },
+        RowData {
+            name: "k8s/pods".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ └─󰋊 Pods".to_string(),
+                "runtime".to_string(),
+                pod_count.to_string(),
+                if app.table_has_error_for(ResourceTab::Pods) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Current pod inventory".to_string(),
+        },
+        RowData {
+            name: "argocd".to_string(),
+            namespace: None,
+            columns: vec![
+                "├─󰀶 ArgoCD".to_string(),
+                compact_label(argo_server, 22),
+                argo_apps.to_string(),
+                argo_state.to_string(),
+            ],
+            detail: "Argo CD application delivery surface".to_string(),
+        },
+        RowData {
+            name: "argocd/apps".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ ├─󰠱 Applications".to_string(),
+                "runtime".to_string(),
+                argo_apps.to_string(),
+                if app.table_has_error_for(ResourceTab::ArgoCdApps) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Argo CD app catalog".to_string(),
+        },
+        RowData {
+            name: "argocd/resources".to_string(),
+            namespace: None,
+            columns: vec![
+                "│ └─󰛀 Resources".to_string(),
+                "runtime".to_string(),
+                argo_resources.to_string(),
+                if app.table_has_error_for(ResourceTab::ArgoCdResources) {
+                    "warn".to_string()
+                } else {
+                    "ok".to_string()
+                },
+            ],
+            detail: "Argo CD managed resource graph".to_string(),
+        },
+        RowData {
+            name: "services".to_string(),
+            namespace: None,
+            columns: vec![
+                "└─󰠧 Services".to_string(),
+                "tooling".to_string(),
+                "7".to_string(),
+                "mapped".to_string(),
+            ],
+            detail: "Operations services exposed in ORCA".to_string(),
+        },
+        RowData {
+            name: "service/helm".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󰠰 Helm".to_string(),
+                "ops".to_string(),
+                "-".to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Helm release management".to_string(),
+        },
+        RowData {
+            name: "service/terraform".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󱁢 Terraform".to_string(),
+                "ops".to_string(),
+                "-".to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Terraform insights and plans".to_string(),
+        },
+        RowData {
+            name: "service/ansible".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󱂚 Ansible".to_string(),
+                "ops".to_string(),
+                "-".to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Ansible execution catalog".to_string(),
+        },
+        RowData {
+            name: "service/docker".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󰡨 Docker".to_string(),
+                "ops".to_string(),
+                "-".to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Container runtime inspection".to_string(),
+        },
+        RowData {
+            name: "service/git".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󰊤 Git".to_string(),
+                "ops".to_string(),
+                "-".to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Repository catalog and apply workflow".to_string(),
+        },
+        RowData {
+            name: "service/argocd".to_string(),
+            namespace: None,
+            columns: vec![
+                "  ├─󰀶 ArgoCD".to_string(),
+                "ops".to_string(),
+                argo_apps.to_string(),
+                argo_state.to_string(),
+            ],
+            detail: "Argo CD automation interface".to_string(),
+        },
+        RowData {
+            name: "service/crd".to_string(),
+            namespace: None,
+            columns: vec![
+                "  └─󰚜 CRD".to_string(),
+                "runtime".to_string(),
+                crd_count.to_string(),
+                "ready".to_string(),
+            ],
+            detail: "Custom resources discovered in cluster".to_string(),
+        },
+    ];
+
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Graph".to_string(),
+            "Domain".to_string(),
+            "Count".to_string(),
+            "State".to_string(),
+        ],
+        rows,
+        Local::now(),
+    );
+    table
+}
+
+fn compact_label(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    out.push('…');
+    out
 }
 
 async fn refresh_argocd_tab(app: &mut App, tab: ResourceTab) {
