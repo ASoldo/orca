@@ -43,6 +43,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Stdout, Write};
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Instant;
@@ -107,6 +108,8 @@ async fn main() -> Result<()> {
         app.set_read_only(true);
     }
     app.set_user(gateway.user().to_string());
+    let (host_user, host_name, host_ip) = resolve_host_identity();
+    app.set_host_identity(host_user, host_name, host_ip);
     app.set_kube_catalog(
         gateway.available_contexts(),
         gateway.available_clusters(),
@@ -151,6 +154,40 @@ fn parse_truthy_env(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on" | "enabled" | "enable"
     )
+}
+
+fn resolve_host_identity() -> (String, String, String) {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "-".to_string());
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string("/etc/hostname").ok().and_then(|raw| {
+                let value = raw.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            })
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let ip = resolve_local_ip().unwrap_or_else(|| "-".to_string());
+    (user, host, ip)
+}
+
+fn resolve_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    let _ = socket.connect("1.1.1.1:80");
+    let addr = socket.local_addr().ok()?;
+    let ip = addr.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
 }
 
 async fn run(app: &mut App, gateway: &mut KubeGateway, refresh_ms: u64) -> Result<()> {
@@ -2349,7 +2386,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "orca".to_string(),
             namespace: None,
             columns: vec![
-                " ORCA".to_string(),
+                "󱢴 ORCA".to_string(),
                 "platform".to_string(),
                 "1".to_string(),
                 "online".to_string(),
@@ -2572,7 +2609,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
     let mut table = TableData::default();
     table.set_rows(
         vec![
-            "Graph".to_string(),
+            "Tree".to_string(),
             "Domain".to_string(),
             "Count".to_string(),
             "State".to_string(),

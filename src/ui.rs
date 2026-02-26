@@ -130,6 +130,7 @@ fn build_left_header_line(app: &App) -> Line<'static> {
     };
 
     let mut spans = Vec::new();
+    let orca_mode = app.active_tab() == ResourceTab::Orca;
     let argo_mode = matches!(
         app.active_tab(),
         ResourceTab::ArgoCdApps
@@ -141,15 +142,35 @@ fn build_left_header_line(app: &App) -> Line<'static> {
             | ResourceTab::ArgoCdCerts
             | ResourceTab::ArgoCdGpgKeys
     );
+    let header_user = if orca_mode {
+        app.host_user()
+    } else {
+        app.user()
+    };
     push_powerline_segment(&mut spans, " ORCA ", Color::Black, ACCENT, PL_A);
     push_powerline_segment(
         &mut spans,
-        format!(" 󰀄 {} ", compact_text(app.user(), 14)),
+        format!(" 󰀄 {} ", compact_text(header_user, 14)),
         Color::White,
         PL_A,
         PL_B,
     );
-    if argo_mode {
+    if orca_mode {
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󰩟 {} ", compact_text(app.host_name(), 20)),
+            Color::White,
+            PL_B,
+            PL_C,
+        );
+        push_powerline_segment(
+            &mut spans,
+            format!(" 󰩠 {} ", compact_text(app.host_ip(), 40)),
+            Color::White,
+            PL_C,
+            Color::Rgb(88, 28, 135),
+        );
+    } else if argo_mode {
         let server_value = compact_text(app.argocd_server(), 24);
         push_powerline_segment(
             &mut spans,
@@ -226,29 +247,31 @@ fn build_left_header_line(app: &App) -> Line<'static> {
             Color::Rgb(88, 28, 135),
         );
     }
-    if let Some(port_forward) = app.port_forward_badge() {
-        push_powerline_segment(
-            &mut spans,
-            format!(" {} ", active_resource),
-            Color::White,
-            Color::Rgb(88, 28, 135),
-            PL_E,
-        );
-        push_powerline_segment(
-            &mut spans,
-            format!(" {} ", compact_text(&port_forward, 18)),
-            Color::White,
-            PL_E,
-            BG,
-        );
-    } else {
-        push_powerline_segment(
-            &mut spans,
-            format!(" {} ", active_resource),
-            Color::White,
-            Color::Rgb(88, 28, 135),
-            BG,
-        );
+    if !orca_mode {
+        if let Some(port_forward) = app.port_forward_badge() {
+            push_powerline_segment(
+                &mut spans,
+                format!(" {} ", active_resource),
+                Color::White,
+                Color::Rgb(88, 28, 135),
+                PL_E,
+            );
+            push_powerline_segment(
+                &mut spans,
+                format!(" {} ", compact_text(&port_forward, 18)),
+                Color::White,
+                PL_E,
+                BG,
+            );
+        } else {
+            push_powerline_segment(
+                &mut spans,
+                format!(" {} ", active_resource),
+                Color::White,
+                Color::Rgb(88, 28, 135),
+                BG,
+            );
+        }
     }
 
     Line::from(spans)
@@ -2214,7 +2237,7 @@ fn display_cluster_endpoint(cluster: &str) -> String {
 
 fn tab_icon(tab: ResourceTab) -> &'static str {
     match tab {
-        ResourceTab::Orca => "",
+        ResourceTab::Orca => "󱢴",
         ResourceTab::ArgoCdApps => "󰀶",
         ResourceTab::ArgoCdResources => "󰛀",
         ResourceTab::ArgoCdProjects => "󰠱",
@@ -2292,7 +2315,7 @@ fn tab_group_label(tab: ResourceTab) -> &'static str {
 
 fn tab_group_icon(tab: ResourceTab) -> &'static str {
     match tab_group_label(tab) {
-        "orca" => "",
+        "orca" => "󱢴",
         "argocd" => "󰀶",
         "workloads" => "󰙨",
         "service" => "󰒓",

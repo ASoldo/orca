@@ -351,6 +351,9 @@ pub struct App {
     available_users: Vec<String>,
     argocd_server: String,
     argocd_selected_app: Option<String>,
+    host_user: String,
+    host_name: String,
+    host_ip: String,
     command_aliases: HashMap<String, String>,
     plugin_commands: Vec<PluginCommandDef>,
     hotkey_commands: Vec<HotkeyCommandDef>,
@@ -449,6 +452,9 @@ impl App {
             available_users: Vec::new(),
             argocd_server: "-".to_string(),
             argocd_selected_app: None,
+            host_user: "-".to_string(),
+            host_name: "-".to_string(),
+            host_ip: "-".to_string(),
             command_aliases: HashMap::new(),
             plugin_commands: Vec::new(),
             hotkey_commands: Vec::new(),
@@ -502,6 +508,18 @@ impl App {
         self.argocd_selected_app.as_deref()
     }
 
+    pub fn host_user(&self) -> &str {
+        &self.host_user
+    }
+
+    pub fn host_name(&self) -> &str {
+        &self.host_name
+    }
+
+    pub fn host_ip(&self) -> &str {
+        &self.host_ip
+    }
+
     pub fn set_argocd_server(&mut self, server: impl Into<String>) {
         let value = server.into();
         if value.trim().is_empty() {
@@ -520,6 +538,25 @@ impl App {
                 Some(trimmed.to_string())
             }
         });
+    }
+
+    pub fn set_host_identity(
+        &mut self,
+        user: impl Into<String>,
+        host: impl Into<String>,
+        ip: impl Into<String>,
+    ) {
+        let normalize = |value: String| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                "-".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        self.host_user = normalize(user.into());
+        self.host_name = normalize(host.into());
+        self.host_ip = normalize(ip.into());
     }
 
     pub fn set_kube_target(
