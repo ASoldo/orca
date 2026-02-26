@@ -168,7 +168,7 @@ fn build_left_header_line(app: &App) -> Line<'static> {
             format!(" 󰩠 {} ", compact_text(app.host_ip(), 40)),
             Color::White,
             PL_C,
-            Color::Rgb(88, 28, 135),
+            BG,
         );
     } else if argo_mode {
         let server_value = compact_text(app.argocd_server(), 24);
