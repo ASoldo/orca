@@ -2567,20 +2567,24 @@ async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<Tab
 
     fn tree_kind_label(kind: &str) -> String {
         match kind.to_ascii_lowercase().as_str() {
-            "service" => "Service".to_string(),
-            "deployment" => "Deployment".to_string(),
-            "replicaset" => "ReplicaSe".to_string(),
-            "replicationcontroller" => "ReplCtrl".to_string(),
-            "statefulset" => "StatefulSe".to_string(),
-            "daemonset" => "DaemonSet".to_string(),
-            "job" => "Job".to_string(),
-            "cronjob" => "CronJob".to_string(),
-            "pod" => "Pod".to_string(),
-            "configmap" => "CfgMap".to_string(),
-            "secret" => "Secret".to_string(),
-            "namespace" => "Namespace".to_string(),
-            "node" => "Node".to_string(),
-            other => other.chars().take(10).collect::<String>(),
+            "service" => "svc".to_string(),
+            "deployment" => "dpl".to_string(),
+            "replicaset" => "rs".to_string(),
+            "replicationcontroller" => "rc".to_string(),
+            "statefulset" => "sts".to_string(),
+            "daemonset" => "ds".to_string(),
+            "job" => "job".to_string(),
+            "cronjob" => "cj".to_string(),
+            "pod" => "po".to_string(),
+            "configmap" => "cm".to_string(),
+            "secret" => "sec".to_string(),
+            "namespace" => "ns".to_string(),
+            "node" => "node".to_string(),
+            other => other
+                .chars()
+                .take(4)
+                .collect::<String>()
+                .to_ascii_lowercase(),
         }
     }
 
@@ -2627,9 +2631,13 @@ async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<Tab
 
         let depth = ancestor_last.len();
         let prefix = if depth == 0 && node.parent.is_none() {
-            "󰜴 ".to_string()
+            String::new()
         } else if depth == 1 {
-            "  ".to_string()
+            if is_last {
+                "└─".to_string()
+            } else {
+                "├─".to_string()
+            }
         } else {
             format!(
                 "{}{}",
