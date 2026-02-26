@@ -2231,6 +2231,14 @@ fn discover_ansible_playbooks(root: &str, max_depth: usize, max_files: usize) ->
 
 async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
     if tab == ResourceTab::Orca {
+        refresh_kubernetes_tab(app, gateway, ResourceTab::Namespaces).await;
+        refresh_kubernetes_tab(app, gateway, ResourceTab::Nodes).await;
+        refresh_kubernetes_tab(app, gateway, ResourceTab::Pods).await;
+        refresh_kubernetes_tab(app, gateway, ResourceTab::CustomResources).await;
+        refresh_argocd_tab(app, ResourceTab::ArgoCdApps).await;
+        if app.argocd_selected_app().is_some() {
+            refresh_argocd_tab(app, ResourceTab::ArgoCdResources).await;
+        }
         let table = build_orca_dashboard_table(app);
         app.set_active_table_data(tab, table);
         app.set_status("ORCA control graph refreshed");
@@ -2249,6 +2257,14 @@ async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
             | ResourceTab::ArgoCdGpgKeys
     ) {
         refresh_argocd_tab(app, tab).await;
+        return;
+    }
+
+    refresh_kubernetes_tab(app, gateway, tab).await;
+}
+
+async fn refresh_kubernetes_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
+    if matches!(tab, ResourceTab::Orca) {
         return;
     }
 
@@ -2333,7 +2349,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "orca".to_string(),
             namespace: None,
             columns: vec![
-                "󰀵 ORCA".to_string(),
+                " ORCA".to_string(),
                 "platform".to_string(),
                 "1".to_string(),
                 "online".to_string(),
@@ -2422,7 +2438,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "k8s/pods".to_string(),
             namespace: None,
             columns: vec![
-                "│ └─󰋊 Pods".to_string(),
+                "│ ├─󰋊 Pods".to_string(),
                 "runtime".to_string(),
                 pod_count.to_string(),
                 if app.table_has_error_for(ResourceTab::Pods) {
@@ -2437,7 +2453,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "argocd".to_string(),
             namespace: None,
             columns: vec![
-                "├─󰀶 ArgoCD".to_string(),
+                "│ └─󰀶 ArgoCD".to_string(),
                 compact_label(argo_server, 22),
                 argo_apps.to_string(),
                 argo_state.to_string(),
@@ -2448,7 +2464,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "argocd/apps".to_string(),
             namespace: None,
             columns: vec![
-                "│ ├─󰠱 Applications".to_string(),
+                "│   ├─󰠱 Applications".to_string(),
                 "runtime".to_string(),
                 argo_apps.to_string(),
                 if app.table_has_error_for(ResourceTab::ArgoCdApps) {
@@ -2463,7 +2479,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             name: "argocd/resources".to_string(),
             namespace: None,
             columns: vec![
-                "│ └─󰛀 Resources".to_string(),
+                "│   └─󰛀 Resources".to_string(),
                 "runtime".to_string(),
                 argo_resources.to_string(),
                 if app.table_has_error_for(ResourceTab::ArgoCdResources) {
@@ -2480,7 +2496,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             columns: vec![
                 "└─󰠧 Services".to_string(),
                 "tooling".to_string(),
-                "7".to_string(),
+                "6".to_string(),
                 "mapped".to_string(),
             ],
             detail: "Operations services exposed in ORCA".to_string(),
@@ -2539,17 +2555,6 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
                 "ready".to_string(),
             ],
             detail: "Repository catalog and apply workflow".to_string(),
-        },
-        RowData {
-            name: "service/argocd".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󰀶 ArgoCD".to_string(),
-                "ops".to_string(),
-                argo_apps.to_string(),
-                argo_state.to_string(),
-            ],
-            detail: "Argo CD automation interface".to_string(),
         },
         RowData {
             name: "service/crd".to_string(),

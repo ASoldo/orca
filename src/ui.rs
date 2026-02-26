@@ -377,12 +377,13 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     });
 
     let constraints = column_constraints(headers.len().max(1));
+    let title = if app.active_tab() == ResourceTab::Orca {
+        format!("Dashboard ({})", visible_rows.len())
+    } else {
+        format!("{} ({})", app.active_tab().title(), visible_rows.len())
+    };
     let block = Block::default()
-        .title(format!(
-            "{} ({})",
-            app.active_tab().title(),
-            visible_rows.len()
-        ))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(if focused {
             Style::default().fg(ACCENT)
@@ -2213,7 +2214,7 @@ fn display_cluster_endpoint(cluster: &str) -> String {
 
 fn tab_icon(tab: ResourceTab) -> &'static str {
     match tab {
-        ResourceTab::Orca => "󰀵",
+        ResourceTab::Orca => "",
         ResourceTab::ArgoCdApps => "󰀶",
         ResourceTab::ArgoCdResources => "󰛀",
         ResourceTab::ArgoCdProjects => "󰠱",
@@ -2291,7 +2292,7 @@ fn tab_group_label(tab: ResourceTab) -> &'static str {
 
 fn tab_group_icon(tab: ResourceTab) -> &'static str {
     match tab_group_label(tab) {
-        "orca" => "󰀵",
+        "orca" => "",
         "argocd" => "󰀶",
         "workloads" => "󰙨",
         "service" => "󰒓",
