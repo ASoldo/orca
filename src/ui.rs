@@ -2050,7 +2050,8 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
 fn resource_tab_help(tab: ResourceTab) -> String {
     match tab {
         ResourceTab::ArgoCdApps => {
-            "Argo CD flow: Enter opens selected app resources  d shows app details".to_string()
+            "Argo CD flow: Enter opens selected app resources  e edit app manifest  d details"
+                .to_string()
         }
         ResourceTab::ArgoCdResources => {
             "Argo CD resources: Enter full panel  e events  l logs  m live manifest  d raw details"

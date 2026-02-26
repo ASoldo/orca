@@ -2428,6 +2428,11 @@ async fn fetch_argocd_apps_table() -> std::result::Result<TableData, String> {
             .and_then(Value::as_str)
             .unwrap_or("-")
             .to_string();
+        let app_namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .to_string();
         let project = item
             .pointer("/spec/project")
             .and_then(Value::as_str)
@@ -2462,7 +2467,7 @@ async fn fetch_argocd_apps_table() -> std::result::Result<TableData, String> {
         let detail = serde_json::to_string_pretty(&item).unwrap_or_else(|_| item.to_string());
         rows.push(RowData {
             name: name.clone(),
-            namespace: Some(dest_namespace.clone()),
+            namespace: Some(app_namespace.clone()),
             columns: vec![name, project, dest_namespace, sync, health, repo, path],
             detail,
         });
@@ -2622,11 +2627,13 @@ async fn fetch_argocd_resources_table(app_name: &str) -> std::result::Result<Tab
 
         let depth = ancestor_last.len();
         let prefix = if depth == 0 && node.parent.is_none() {
+            "󰜴 ".to_string()
+        } else if depth == 1 {
             "  ".to_string()
         } else {
             format!(
                 "{}{}",
-                "  ".repeat(depth),
+                "  ".repeat(depth.saturating_sub(1)),
                 if is_last { "└─" } else { "├─" }
             )
         };

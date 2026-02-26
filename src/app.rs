@@ -2741,7 +2741,13 @@ impl App {
                 AppCommand::None
             }
             "logs" => self.create_logs_command(false),
-            "edit" | "e" => self.prepare_edit_command(),
+            "edit" | "e" => {
+                if self.active_tab() == ResourceTab::ArgoCdResources {
+                    self.prepare_argocd_resource_section(ArgoResourcePanelSection::Events)
+                } else {
+                    self.prepare_edit_command()
+                }
+            }
             "delete" | "del" => self.prepare_delete_confirmation(),
             "restart" => self.prepare_restart_confirmation(),
             "scale" => {
@@ -4115,8 +4121,8 @@ impl App {
 
     fn kubectl_resource_for_tab(&self, tab: ResourceTab) -> Option<(String, bool)> {
         match tab {
-            ResourceTab::ArgoCdApps
-            | ResourceTab::ArgoCdResources
+            ResourceTab::ArgoCdApps => Some(("applications.argoproj.io".to_string(), true)),
+            ResourceTab::ArgoCdResources
             | ResourceTab::ArgoCdProjects
             | ResourceTab::ArgoCdRepos
             | ResourceTab::ArgoCdClusters
@@ -5023,6 +5029,47 @@ mod tests {
                 namespace: Some("argocd-demo".to_string()),
                 name: "guestbook-ui-6595f948db".to_string(),
                 section: ArgoResourcePanelSection::Events,
+            }
+        );
+    }
+
+    #[test]
+    fn edit_on_argocd_apps_uses_kubectl_edit_flow() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+        let mut apps = TableData::default();
+        apps.set_rows(
+            vec![
+                "Name".to_string(),
+                "Project".to_string(),
+                "Namespace".to_string(),
+            ],
+            vec![RowData {
+                name: "guestbook".to_string(),
+                namespace: Some("argocd".to_string()),
+                columns: vec![
+                    "guestbook".to_string(),
+                    "default".to_string(),
+                    "argocd-demo".to_string(),
+                ],
+                detail: "kind: Application".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::ArgoCdApps, apps);
+        app.switch_to_tab(ResourceTab::ArgoCdApps);
+
+        let cmd = app.apply_action(Action::EditResource);
+        assert_eq!(
+            cmd,
+            AppCommand::EditSelected {
+                resource: "applications.argoproj.io".to_string(),
+                namespace: Some("argocd".to_string()),
+                name: "guestbook".to_string(),
             }
         );
     }
