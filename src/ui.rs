@@ -84,6 +84,14 @@ fn build_left_header_line(app: &App) -> Line<'static> {
             "󰞷",
             "containers"
         )
+    } else if app.catalog_overlay_active() {
+        format!(
+            "{} {}  {} {}",
+            group_icon,
+            compact_text(group, 10),
+            "󰈔",
+            "catalog"
+        )
     } else if app.table_overlay_active() {
         let (icon, label) = match app.table_overlay_kind() {
             Some(TableOverlayKind::PodLogs) => ("󰍩", "logs"),
@@ -320,6 +328,56 @@ fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_table(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     if app.container_picker_active() {
         render_container_picker(frame, area, app, focused);
+        return;
+    }
+
+    if app.catalog_overlay_active() {
+        let headers = app.active_headers();
+        let visible_rows = app.active_visible_rows();
+
+        let header_row = Row::new(headers.iter().map(|header| {
+            Cell::from(header.clone()).style(Style::default().add_modifier(Modifier::BOLD))
+        }))
+        .height(1)
+        .style(Style::default().fg(ACCENT));
+
+        let rows = visible_rows.iter().map(|row| {
+            Row::new(
+                row.columns
+                    .clone()
+                    .into_iter()
+                    .map(|column| Cell::from(column).style(Style::default().fg(Color::White))),
+            )
+        });
+
+        let table = Table::new(rows, column_constraints(headers.len().max(1)))
+            .header(header_row)
+            .block(
+                Block::default()
+                    .title(
+                        app.catalog_overlay_title()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "Catalog".to_string()),
+                    )
+                    .borders(Borders::ALL)
+                    .border_style(if focused {
+                        Style::default().fg(ACCENT)
+                    } else {
+                        Style::default().fg(MUTED)
+                    })
+                    .style(Style::default().bg(PANEL)),
+            )
+            .column_spacing(1)
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(24, 36, 58))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("󰜴 ");
+
+        let mut state = TableState::default();
+        state.select(app.active_selected_index());
+        frame.render_stateful_widget(table, area, &mut state);
         return;
     }
 
@@ -844,6 +902,10 @@ fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
                     100
                 } else if state.contains("warn") || state.contains("mapped") {
                     60
+                } else if state.contains("loading") || state.contains("connected") {
+                    75
+                } else if state.contains("missing") || state.contains("disconnected") {
+                    40
                 } else {
                     35
                 }
@@ -1138,7 +1200,7 @@ fn row_health_score(tab: ResourceTab, row: &RowData) -> u64 {
 fn selected_metric_line(tab: ResourceTab, row: &RowData) -> String {
     match tab {
         ResourceTab::Orca => format!(
-            "domain:{} count:{} state:{}",
+            "domain:{} value:{} state:{}",
             row.columns.get(1).map_or("-", String::as_str),
             row.columns.get(2).map_or("-", String::as_str),
             row.columns.get(3).map_or("-", String::as_str)
@@ -2079,7 +2141,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
     lines.push(resource_commands_help(app.active_tab()));
     if app.active_tab() == ResourceTab::Orca {
         lines.push(
-            "Global ops: Enter drill-down  :orca  :k8s  :argocd  :tools  r refresh  ? close help  q quit"
+            "Global ops: Enter drill-down  :dashboard  :k8s  :argocd  :tools  r refresh  ? close help  q quit"
                 .to_string(),
         );
     } else if app.active_tab() == ResourceTab::ArgoCdResources {
@@ -2098,9 +2160,7 @@ fn contextual_help_lines(app: &App) -> Vec<String> {
 
 fn resource_tab_help(tab: ResourceTab) -> String {
     match tab {
-        ResourceTab::Orca => {
-            "ORCA graph: Enter drills into k8s, argocd, and service nodes".to_string()
-        }
+        ResourceTab::Orca => "ORCA graph: Enter drills into cluster and tool nodes".to_string(),
         ResourceTab::ArgoCdApps => {
             "Argo CD flow: Enter opens selected app resources  e edit app manifest  d details"
                 .to_string()
@@ -2154,7 +2214,7 @@ fn resource_tab_help(tab: ResourceTab) -> String {
 fn resource_commands_help(tab: ResourceTab) -> String {
     match tab {
         ResourceTab::Orca => {
-            "Commands: :orca  :k8s [resource]  :argocd [app]  :tools  :alerts  :pulses"
+            "Commands: :dashboard  :orca  :k8s [resource]  :argocd [app]  :tools  :alerts  :pulses"
                 .to_string()
         }
         ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources => {

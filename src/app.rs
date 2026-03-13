@@ -35,6 +35,20 @@ pub enum TableOverlayKind {
     Shell,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CatalogOverlayKind {
+    Contexts,
+    Clusters,
+    Users,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogOverlayState {
+    title: String,
+    kind: CatalogOverlayKind,
+    table: TableData,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgoResourcePanelSection {
     Events,
@@ -132,6 +146,23 @@ pub struct HotkeyCommandDef {
     pub command: String,
     pub jump: bool,
     pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostToolStatus {
+    pub key: String,
+    pub label: String,
+    pub icon: String,
+    pub command: String,
+    pub available: bool,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterArgoCdState {
+    Unknown,
+    Absent,
+    Present,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +323,7 @@ struct ViewState {
     detail_mode: DetailPaneMode,
     show_table_overview: bool,
     selected_crd: Option<String>,
+    catalog_overlay: Option<CatalogOverlayState>,
     table_overlay: Option<String>,
     table_overlay_title: Option<String>,
     table_overlay_kind: TableOverlayKind,
@@ -328,6 +360,7 @@ pub struct App {
     cluster: String,
     context: String,
     user: String,
+    catalog_overlay: Option<CatalogOverlayState>,
     table_overlay: Option<String>,
     table_overlay_title: Option<String>,
     table_overlay_kind: TableOverlayKind,
@@ -354,6 +387,8 @@ pub struct App {
     host_user: String,
     host_name: String,
     host_ip: String,
+    host_tools: Vec<HostToolStatus>,
+    cluster_argocd: ClusterArgoCdState,
     command_aliases: HashMap<String, String>,
     plugin_commands: Vec<PluginCommandDef>,
     hotkey_commands: Vec<HotkeyCommandDef>,
@@ -393,6 +428,7 @@ impl App {
             detail_mode: DetailPaneMode::Dashboard,
             show_table_overview: false,
             selected_crd: None,
+            catalog_overlay: None,
             table_overlay: None,
             table_overlay_title: None,
             table_overlay_kind: TableOverlayKind::Generic,
@@ -429,6 +465,7 @@ impl App {
             cluster,
             context,
             user: "-".to_string(),
+            catalog_overlay: None,
             table_overlay: None,
             table_overlay_title: None,
             table_overlay_kind: TableOverlayKind::Generic,
@@ -455,6 +492,8 @@ impl App {
             host_user: "-".to_string(),
             host_name: "-".to_string(),
             host_ip: "-".to_string(),
+            host_tools: Vec::new(),
+            cluster_argocd: ClusterArgoCdState::Unknown,
             command_aliases: HashMap::new(),
             plugin_commands: Vec::new(),
             hotkey_commands: Vec::new(),
@@ -520,6 +559,48 @@ impl App {
         &self.host_ip
     }
 
+    pub fn host_tools(&self) -> &[HostToolStatus] {
+        &self.host_tools
+    }
+
+    fn host_tool_available(&self, key: &str) -> bool {
+        self.host_tools
+            .iter()
+            .find(|tool| tool.key == key)
+            .map(|tool| tool.available)
+            .unwrap_or(false)
+    }
+
+    pub fn host_tool_count(&self) -> usize {
+        self.host_tools.len()
+    }
+
+    pub fn cluster_argocd_state(&self) -> ClusterArgoCdState {
+        self.cluster_argocd
+    }
+
+    pub fn cluster_has_argocd(&self) -> bool {
+        self.cluster_argocd == ClusterArgoCdState::Present
+    }
+
+    pub fn host_tool_available_count(&self) -> usize {
+        self.host_tools.iter().filter(|tool| tool.available).count()
+    }
+
+    pub fn host_tool_pending_count(&self) -> usize {
+        self.host_tools
+            .iter()
+            .filter(|tool| tool.summary == "probe pending")
+            .count()
+    }
+
+    pub fn table_loaded_for(&self, tab: ResourceTab) -> bool {
+        self.tables
+            .get(&tab)
+            .and_then(|table| table.last_refreshed.as_ref())
+            .is_some()
+    }
+
     pub fn set_argocd_server(&mut self, server: impl Into<String>) {
         let value = server.into();
         if value.trim().is_empty() {
@@ -557,6 +638,51 @@ impl App {
         self.host_user = normalize(user.into());
         self.host_name = normalize(host.into());
         self.host_ip = normalize(ip.into());
+    }
+
+    pub fn set_host_tools_silent(&mut self, tools: Vec<HostToolStatus>) {
+        self.set_host_tools_with_status(tools, false);
+    }
+
+    pub fn reset_cluster_runtime_state(&mut self) {
+        let tabs = self.tabs.clone();
+        for tab in tabs {
+            if tab != ResourceTab::Orca {
+                self.tables.insert(tab, TableData::default());
+            }
+        }
+        self.discovered_crds.clear();
+        self.selected_crd = None;
+        self.argocd_selected_app = None;
+        self.cluster_argocd = ClusterArgoCdState::Unknown;
+        self.overview_metrics = OverviewMetrics::default();
+        self.alert_snapshot = AlertSnapshot::default();
+        self.clamp_all_selections();
+    }
+
+    fn reset_namespace_runtime_state(&mut self) {
+        let tabs = self.tabs.clone();
+        for tab in tabs {
+            if is_namespace_scoped_runtime_tab(tab) {
+                self.tables.insert(tab, TableData::default());
+            }
+        }
+        self.overview_metrics = OverviewMetrics::default();
+        self.alert_snapshot = AlertSnapshot::default();
+        self.clamp_all_selections();
+    }
+
+    fn set_namespace_scope_with_reset(&mut self, scope: NamespaceScope) {
+        self.namespace_scope = scope;
+        self.reset_namespace_runtime_state();
+        self.show_table_overview = false;
+        self.clear_table_overlay();
+        self.clear_detail_overlay();
+        self.container_picker = None;
+        self.detail_mode = DetailPaneMode::Dashboard;
+        self.detail_scroll = 0;
+        self.focus = FocusPane::Table;
+        self.clamp_all_selections();
     }
 
     pub fn set_kube_target(
@@ -754,10 +880,17 @@ impl App {
         self.container_picker.is_some()
     }
 
+    pub fn catalog_overlay_active(&self) -> bool {
+        self.catalog_overlay.is_some()
+    }
+
     #[allow(dead_code)]
     pub fn pane_label(&self) -> &'static str {
         if self.container_picker_active() {
             return "ctr";
+        }
+        if self.catalog_overlay_active() {
+            return "tbl";
         }
         if self.table_overlay_active() {
             return match self.table_overlay_kind {
@@ -785,6 +918,12 @@ impl App {
 
     pub fn table_overlay_title(&self) -> Option<&str> {
         self.table_overlay_title.as_deref()
+    }
+
+    pub fn catalog_overlay_title(&self) -> Option<&str> {
+        self.catalog_overlay
+            .as_ref()
+            .map(|overlay| overlay.title.as_str())
     }
 
     pub fn table_overlay_text(&self) -> Option<&str> {
@@ -975,6 +1114,12 @@ impl App {
 
     #[allow(dead_code)]
     pub fn active_last_refresh(&self) -> Option<String> {
+        if let Some(overlay) = &self.catalog_overlay {
+            return overlay
+                .table
+                .last_refreshed
+                .map(|ts| ts.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
         self.tables
             .get(&self.active_tab())
             .and_then(|table| table.last_refreshed)
@@ -982,6 +1127,9 @@ impl App {
     }
 
     pub fn active_headers(&self) -> Vec<String> {
+        if let Some(overlay) = &self.catalog_overlay {
+            return overlay.table.headers.clone();
+        }
         self.tables
             .get(&self.active_tab())
             .map(|table| table.headers.clone())
@@ -989,10 +1137,16 @@ impl App {
     }
 
     pub fn active_visible_rows(&self) -> Vec<&RowData> {
+        if let Some(overlay) = &self.catalog_overlay {
+            return overlay.table.rows.iter().collect();
+        }
         self.visible_rows_for(self.active_tab())
     }
 
     pub fn active_visible_error(&self) -> Option<&str> {
+        if let Some(overlay) = &self.catalog_overlay {
+            return overlay.table.error.as_deref();
+        }
         self.tables
             .get(&self.active_tab())
             .and_then(|table| table.error.as_deref())
@@ -1002,6 +1156,10 @@ impl App {
         let visible_len = self.active_visible_len();
         if visible_len == 0 {
             return None;
+        }
+
+        if let Some(overlay) = &self.catalog_overlay {
+            return Some(overlay.table.selected.min(visible_len.saturating_sub(1)));
         }
 
         let table = self.tables.get(&self.active_tab())?;
@@ -1161,6 +1319,8 @@ impl App {
     pub fn detail_title(&self) -> String {
         if let Some(title) = &self.detail_overlay_title {
             title.clone()
+        } else if let Some(overlay) = &self.catalog_overlay {
+            format!("{} Details", overlay.title)
         } else {
             format!("{} Details", self.active_tab().title())
         }
@@ -1217,6 +1377,7 @@ impl App {
         detail: String,
         kind: TableOverlayKind,
     ) {
+        self.catalog_overlay = None;
         self.table_overlay_title = Some(title.into());
         self.table_overlay = Some(detail);
         self.table_overlay_kind = kind;
@@ -1229,12 +1390,36 @@ impl App {
         self.clear_detail_overlay();
     }
 
+    fn set_catalog_overlay(
+        &mut self,
+        title: impl Into<String>,
+        kind: CatalogOverlayKind,
+        mut table: TableData,
+    ) {
+        table.selected = table.selected.min(table.rows.len().saturating_sub(1));
+        self.clear_output_overlay();
+        self.catalog_overlay = Some(CatalogOverlayState {
+            title: title.into(),
+            kind,
+            table,
+        });
+        self.container_picker = None;
+        self.show_table_overview = false;
+        self.focus = FocusPane::Table;
+        self.detail_mode = DetailPaneMode::Dashboard;
+        self.clear_detail_overlay();
+    }
+
     pub fn set_overview_metrics(&mut self, metrics: OverviewMetrics) {
         self.overview_metrics = metrics;
     }
 
     pub fn set_alert_snapshot(&mut self, snapshot: AlertSnapshot) {
         self.alert_snapshot = snapshot;
+    }
+
+    pub fn status_text(&self) -> &str {
+        &self.status
     }
 
     pub fn set_table_page_size(&mut self, rows: usize) {
@@ -1378,7 +1563,9 @@ impl App {
                 AppCommand::None
             }
             Action::EnterResource => {
-                if self.table_overlay_active() {
+                if self.catalog_overlay_active() {
+                    self.enter_catalog_overlay_selection()
+                } else if self.table_overlay_active() {
                     self.status = "Output view is read-only (Esc to close)".to_string();
                     AppCommand::None
                 } else {
@@ -1463,6 +1650,9 @@ impl App {
                     } else {
                         self.status = "Closed container list".to_string();
                     }
+                } else if self.catalog_overlay_active() {
+                    self.clear_catalog_overlay();
+                    self.status = "Closed catalog".to_string();
                 } else if self.table_overlay_active() {
                     if let Some(previous_picker) = self.table_overlay_return_picker.clone() {
                         self.clear_table_overlay();
@@ -1556,7 +1746,20 @@ impl App {
         }
     }
 
-    pub fn set_active_table_data(&mut self, tab: ResourceTab, mut table: TableData) {
+    pub fn set_active_table_data(&mut self, tab: ResourceTab, table: TableData) {
+        self.set_active_table_data_with_status(tab, table, true);
+    }
+
+    pub fn set_active_table_data_silent(&mut self, tab: ResourceTab, table: TableData) {
+        self.set_active_table_data_with_status(tab, table, false);
+    }
+
+    fn set_active_table_data_with_status(
+        &mut self,
+        tab: ResourceTab,
+        mut table: TableData,
+        update_status: bool,
+    ) {
         let selected_identity = self.selected_row_identity_for_tab(tab);
         let previous_selected = self.selected_index_for_tab(tab);
         table.selected = table.selected.min(table.rows.len().saturating_sub(1));
@@ -1566,7 +1769,9 @@ impl App {
         } else {
             self.set_selected_index_for_tab(tab, previous_selected);
         }
-        self.status = format!("{} updated", tab.title());
+        if update_status {
+            self.status = format!("{} updated", tab.title());
+        }
     }
 
     pub fn set_active_tab_error(&mut self, tab: ResourceTab, error: impl Into<String>) {
@@ -1593,13 +1798,24 @@ impl App {
         self.status = normalize_status_text(status.into());
     }
 
-    pub fn set_custom_resources(&mut self, mut crds: Vec<CustomResourceDef>) {
+    pub fn set_custom_resources_silent(&mut self, crds: Vec<CustomResourceDef>) {
+        self.set_custom_resources_with_status(crds, false);
+    }
+
+    fn set_custom_resources_with_status(
+        &mut self,
+        mut crds: Vec<CustomResourceDef>,
+        update_status: bool,
+    ) {
         crds.sort_by(|left, right| left.name.cmp(&right.name));
         self.discovered_crds = crds;
+        self.cluster_argocd = detect_cluster_argocd(&self.discovered_crds);
 
         if self.discovered_crds.is_empty() {
             self.selected_crd = None;
-            self.status = "No CRDs discovered".to_string();
+            if update_status {
+                self.status = "No CRDs discovered".to_string();
+            }
             return;
         }
 
@@ -1610,16 +1826,37 @@ impl App {
 
         self.selected_crd =
             existing.or_else(|| self.discovered_crds.first().map(|crd| crd.name.clone()));
-        self.status = format!(
-            "Discovered {} CRDs (active: {})",
-            self.discovered_crds.len(),
-            self.selected_crd.as_deref().unwrap_or("-")
-        );
+        if update_status {
+            self.status = format!(
+                "Discovered {} CRDs (active: {})",
+                self.discovered_crds.len(),
+                self.selected_crd.as_deref().unwrap_or("-")
+            );
+        }
     }
 
     pub fn selected_custom_resource(&self) -> Option<&CustomResourceDef> {
         let selected = self.selected_crd.as_deref()?;
         self.discovered_crds.iter().find(|crd| crd.name == selected)
+    }
+
+    fn set_host_tools_with_status(&mut self, mut tools: Vec<HostToolStatus>, update_status: bool) {
+        for tool in &mut tools {
+            tool.key = tool.key.trim().to_string();
+            tool.label = tool.label.trim().to_string();
+            tool.icon = tool.icon.trim().to_string();
+            tool.command = tool.command.trim().to_string();
+            tool.summary = normalize_status_text(tool.summary.clone());
+        }
+
+        self.host_tools = tools;
+        if update_status {
+            let available = self.host_tool_available_count();
+            self.status = format!(
+                "Host tools refreshed ({available}/{})",
+                self.host_tool_count()
+            );
+        }
     }
 
     fn visible_rows_for(&self, tab: ResourceTab) -> Vec<&RowData> {
@@ -1635,10 +1872,26 @@ impl App {
     }
 
     fn active_visible_len(&self) -> usize {
+        if let Some(overlay) = &self.catalog_overlay {
+            return overlay.table.rows.len();
+        }
         self.visible_rows_for(self.active_tab()).len()
     }
 
     fn move_selection(&mut self, delta: isize) {
+        if let Some(overlay) = self.catalog_overlay.as_mut() {
+            let visible_len = overlay.table.rows.len();
+            if visible_len == 0 {
+                overlay.table.selected = 0;
+                return;
+            }
+            let max_index = visible_len.saturating_sub(1) as isize;
+            let current = overlay.table.selected.min(max_index as usize) as isize;
+            let next = (current + delta).clamp(0, max_index) as usize;
+            overlay.table.selected = next;
+            return;
+        }
+
         let visible_len = self.active_visible_len();
         let table = self.tables.get_mut(&self.active_tab());
 
@@ -1684,12 +1937,20 @@ impl App {
     }
 
     fn select_first(&mut self) {
+        if let Some(overlay) = self.catalog_overlay.as_mut() {
+            overlay.table.selected = 0;
+            return;
+        }
         if let Some(table) = self.tables.get_mut(&self.active_tab()) {
             table.selected = 0;
         }
     }
 
     fn select_last(&mut self) {
+        if let Some(overlay) = self.catalog_overlay.as_mut() {
+            overlay.table.selected = overlay.table.rows.len().saturating_sub(1);
+            return;
+        }
         let visible_len = self.active_visible_len();
         if let Some(table) = self.tables.get_mut(&self.active_tab()) {
             table.selected = visible_len.saturating_sub(1);
@@ -1721,6 +1982,12 @@ impl App {
                 .filter(|row| row.matches_filter(&filter))
                 .count();
             table.selected = table.selected.min(visible_len.saturating_sub(1));
+        }
+        if let Some(overlay) = self.catalog_overlay.as_mut() {
+            overlay.table.selected = overlay
+                .table
+                .selected
+                .min(overlay.table.rows.len().saturating_sub(1));
         }
     }
 
@@ -1814,6 +2081,7 @@ impl App {
             detail_mode: self.detail_mode,
             show_table_overview: self.show_table_overview,
             selected_crd: self.selected_crd.clone(),
+            catalog_overlay: self.catalog_overlay.clone(),
             table_overlay: self.table_overlay.clone(),
             table_overlay_title: self.table_overlay_title.clone(),
             table_overlay_kind: self.table_overlay_kind,
@@ -1841,6 +2109,7 @@ impl App {
         self.detail_mode = state.detail_mode;
         self.show_table_overview = state.show_table_overview;
         self.selected_crd = state.selected_crd.clone();
+        self.catalog_overlay = state.catalog_overlay.clone();
         self.table_overlay = state.table_overlay.clone();
         self.table_overlay_title = state.table_overlay_title.clone();
         self.table_overlay_kind = state.table_overlay_kind;
@@ -1886,6 +2155,7 @@ impl App {
             state.focus = FocusPane::Table;
             state.detail_mode = DetailPaneMode::Dashboard;
             state.show_table_overview = false;
+            state.catalog_overlay = None;
             state.table_overlay = None;
             state.table_overlay_title = None;
             state.table_overlay_kind = TableOverlayKind::Generic;
@@ -2029,6 +2299,8 @@ impl App {
     fn command_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "orca".to_string(),
+            "dashboard".to_string(),
+            "home".to_string(),
             "help".to_string(),
             "readonly".to_string(),
             "readonly on".to_string(),
@@ -2185,6 +2457,8 @@ impl App {
     fn jump_completions(&self) -> Vec<String> {
         let mut candidates = vec![
             "orca".to_string(),
+            "dashboard".to_string(),
+            "home".to_string(),
             "ops".to_string(),
             "readonly".to_string(),
             "config".to_string(),
@@ -2383,16 +2657,8 @@ impl App {
             ResourceTab::Namespaces => {
                 self.push_flow_state();
                 let namespace = row_name;
-                self.namespace_scope = NamespaceScope::Named(namespace.clone());
+                self.set_namespace_scope_with_reset(NamespaceScope::Named(namespace.clone()));
                 self.filter.clear();
-                self.clamp_all_selections();
-                self.show_table_overview = false;
-                self.clear_table_overlay();
-                self.clear_detail_overlay();
-                self.container_picker = None;
-                self.detail_mode = DetailPaneMode::Dashboard;
-                self.detail_scroll = 0;
-                self.focus = FocusPane::Table;
                 self.active_tab_index = self
                     .tabs
                     .iter()
@@ -2464,6 +2730,38 @@ impl App {
         }
     }
 
+    fn enter_catalog_overlay_selection(&mut self) -> AppCommand {
+        let Some(overlay) = self.catalog_overlay.as_ref() else {
+            self.status = "No catalog row selected".to_string();
+            return AppCommand::None;
+        };
+        let Some(row) = self.active_selected_row() else {
+            self.status = "No catalog row selected".to_string();
+            return AppCommand::None;
+        };
+
+        let target = row.name.clone();
+        let action = overlay.kind;
+        self.clear_catalog_overlay();
+        self.clear_detail_overlay();
+        self.detail_mode = DetailPaneMode::Dashboard;
+        self.focus = FocusPane::Table;
+        match action {
+            CatalogOverlayKind::Contexts => {
+                self.status = format!("Switching context to '{target}'");
+                AppCommand::SwitchContext { context: target }
+            }
+            CatalogOverlayKind::Clusters => {
+                self.status = format!("Switching cluster to '{target}'");
+                AppCommand::SwitchCluster { cluster: target }
+            }
+            CatalogOverlayKind::Users => {
+                self.status = format!("Switching user to '{target}'");
+                AppCommand::SwitchUser { user: target }
+            }
+        }
+    }
+
     fn enter_orca_node(&mut self, node: &str) -> AppCommand {
         match node {
             "orca" => {
@@ -2486,29 +2784,80 @@ impl App {
             "k8s/namespaces" => self.switch_to_tab(ResourceTab::Namespaces),
             "k8s/nodes" => self.switch_to_tab(ResourceTab::Nodes),
             "k8s/pods" => self.switch_to_tab(ResourceTab::Pods),
+            "k8s/crd" => self.switch_to_tab(ResourceTab::CustomResources),
             "argocd" | "argocd/apps" => self.open_argocd_command(vec!["apps".to_string()]),
             "argocd/resources" => self.open_argocd_command(vec!["resources".to_string()]),
-            "services" => {
-                self.status = "Select a concrete service node".to_string();
-                AppCommand::None
+            "tools" => AppCommand::InspectTooling,
+            "tool/kubectl" => AppCommand::InspectTooling,
+            "tool/oc" => {
+                if self.host_tool_available("oc") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::OpenShiftProjects,
+                    }
+                } else {
+                    self.status = "oc is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
             }
-            "service/helm" => AppCommand::InspectOps {
-                target: OpsInspectTarget::HelmReleases,
-            },
-            "service/terraform" => AppCommand::InspectOps {
-                target: OpsInspectTarget::TerraformOverview,
-            },
-            "service/ansible" => AppCommand::InspectOps {
-                target: OpsInspectTarget::AnsibleOverview,
-            },
-            "service/docker" => AppCommand::InspectOps {
-                target: OpsInspectTarget::DockerOverview,
-            },
-            "service/git" => AppCommand::InspectOps {
-                target: OpsInspectTarget::GitCatalog,
-            },
-            "service/argocd" => self.open_argocd_command(vec!["apps".to_string()]),
-            "service/crd" => self.switch_to_tab(ResourceTab::CustomResources),
+            "tool/helm" => {
+                if self.host_tool_available("helm") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::HelmReleases,
+                    }
+                } else {
+                    self.status = "helm is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/argocd" => {
+                if self.host_tool_available("argocd") {
+                    self.open_argocd_command(vec!["apps".to_string()])
+                } else {
+                    self.status = "argocd is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/terraform" => {
+                if self.host_tool_available("terraform") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::TerraformOverview,
+                    }
+                } else {
+                    self.status = "terraform is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/ansible-playbook" => {
+                if self.host_tool_available("ansible-playbook") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::AnsibleOverview,
+                    }
+                } else {
+                    self.status = "ansible-playbook is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/docker" => {
+                if self.host_tool_available("docker") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::DockerOverview,
+                    }
+                } else {
+                    self.status = "docker is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/git" => {
+                if self.host_tool_available("git") {
+                    AppCommand::InspectOps {
+                        target: OpsInspectTarget::GitCatalog,
+                    }
+                } else {
+                    self.status = "git is not available on this host".to_string();
+                    AppCommand::InspectTooling
+                }
+            }
+            "tool/kustomize" | "tool/kubectl-who-can" => AppCommand::InspectTooling,
             _ => {
                 self.status = format!("No ORCA drill-down for '{node}'");
                 AppCommand::None
@@ -2569,7 +2918,9 @@ impl App {
 
         let name = row.name.clone();
         self.show_table_overview = false;
-        self.clear_table_overlay();
+        if !self.catalog_overlay_active() {
+            self.clear_table_overlay();
+        }
         self.container_picker = None;
         self.clear_detail_overlay();
         self.detail_mode = DetailPaneMode::Details;
@@ -2586,19 +2937,13 @@ impl App {
         use_seed_filter: bool,
     ) -> AppCommand {
         if let Some(namespace) = namespace {
-            self.namespace_scope = NamespaceScope::Named(namespace);
+            self.set_namespace_scope_with_reset(NamespaceScope::Named(namespace));
         }
         self.filter = if use_seed_filter {
             seed_filter.to_string()
         } else {
             String::new()
         };
-        self.show_table_overview = false;
-        self.clear_table_overlay();
-        self.clear_detail_overlay();
-        self.container_picker = None;
-        self.detail_mode = DetailPaneMode::Dashboard;
-        self.focus = FocusPane::Table;
         self.clamp_all_selections();
 
         let switched = self.switch_to_tab(ResourceTab::Pods);
@@ -2824,13 +3169,15 @@ impl App {
                 AppCommand::None
             }
             "all-ns" | "allns" | "all" | "all-namespaces" => {
-                self.namespace_scope = NamespaceScope::All;
+                self.set_namespace_scope_with_reset(NamespaceScope::All);
                 self.status = "Namespace scope set to all".to_string();
                 AppCommand::RefreshAll
             }
             "ns" | "namespace" | "namespaces" => {
                 if let Some(namespace) = parts.next() {
-                    self.namespace_scope = NamespaceScope::Named(namespace.to_string());
+                    self.set_namespace_scope_with_reset(NamespaceScope::Named(
+                        namespace.to_string(),
+                    ));
                     self.status = format!("Namespace scope set to '{namespace}'");
                     AppCommand::RefreshAll
                 } else {
@@ -3154,35 +3501,51 @@ impl App {
     }
 
     fn show_context_catalog_overlay(&mut self) {
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "{:<2} {:<28} {:<24} {:<22} {}",
-            "", "NAME", "CLUSTER", "AUTHINFO", "NAMESPACE"
-        ));
+        let mut rows = Vec::new();
+        let mut selected = 0usize;
 
-        if self.context_catalog.is_empty() {
-            lines.push("No contexts found in kubeconfig".to_string());
-        } else {
-            for row in &self.context_catalog {
-                let active = if row.context == self.context {
-                    "*"
-                } else {
-                    " "
-                };
-                lines.push(format!(
-                    "{:<2} {:<28} {:<24} {:<22} {}",
-                    active,
-                    table_cell(&row.context, 28),
-                    table_cell(&row.cluster, 24),
-                    table_cell(&row.auth_info, 22),
-                    row.namespace
-                ));
+        for (index, row) in self.context_catalog.iter().enumerate() {
+            if row.context == self.context {
+                selected = index;
             }
+            rows.push(RowData {
+                name: row.context.clone(),
+                namespace: None,
+                columns: vec![
+                    if row.context == self.context {
+                        "*".to_string()
+                    } else {
+                        String::new()
+                    },
+                    row.context.clone(),
+                    row.cluster.clone(),
+                    row.auth_info.clone(),
+                    row.namespace.clone(),
+                ],
+                detail: format!(
+                    "Context: {}\nCluster: {}\nAuthInfo: {}\nNamespace: {}\n\nEnter switches to this context.",
+                    row.context, row.cluster, row.auth_info, row.namespace
+                ),
+            });
         }
 
-        self.set_output_overlay(
-            format!("contexts(all)[{}]", self.context_catalog.len()),
-            lines.join("\n"),
+        let mut table = TableData::default();
+        table.set_rows(
+            vec![
+                "".to_string(),
+                "Context".to_string(),
+                "Cluster".to_string(),
+                "AuthInfo".to_string(),
+                "Namespace".to_string(),
+            ],
+            rows,
+            Local::now(),
+        );
+        table.selected = selected.min(table.rows.len().saturating_sub(1));
+        self.set_catalog_overlay(
+            format!("contexts(all)[{}]", table.rows.len()),
+            CatalogOverlayKind::Contexts,
+            table,
         );
         self.status = "Context catalog opened (:ctx <name> to switch)".to_string();
     }
@@ -3206,42 +3569,57 @@ impl App {
         clusters.sort();
         clusters.dedup();
 
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "{:<2} {:<32} {:<9} {}",
-            "", "CLUSTER", "CONTEXTS", "USERS"
-        ));
+        let mut rows = Vec::new();
+        let mut selected = 0usize;
 
-        if clusters.is_empty() {
-            lines.push("No clusters found in kubeconfig".to_string());
-        } else {
-            for cluster in &clusters {
-                let (contexts, users) = cluster_map
-                    .get(cluster)
-                    .map(|(contexts, users)| (contexts.len(), users.len()))
-                    .unwrap_or((0, 0));
-                let active = if self
-                    .context_catalog
-                    .iter()
-                    .any(|row| row.context == self.context && row.cluster == *cluster)
-                {
-                    "*"
-                } else {
-                    " "
-                };
-                lines.push(format!(
-                    "{:<2} {:<32} {:<9} {}",
-                    active,
-                    table_cell(cluster, 32),
-                    contexts,
-                    users
-                ));
+        for (index, cluster) in clusters.iter().enumerate() {
+            let (contexts, users) = cluster_map
+                .get(cluster)
+                .map(|(contexts, users)| (contexts.len(), users.len()))
+                .unwrap_or((0, 0));
+            let active = self
+                .context_catalog
+                .iter()
+                .any(|row| row.context == self.context && row.cluster == *cluster);
+            if active {
+                selected = index;
             }
+            rows.push(RowData {
+                name: cluster.clone(),
+                namespace: None,
+                columns: vec![
+                    if active {
+                        "*".to_string()
+                    } else {
+                        String::new()
+                    },
+                    cluster.clone(),
+                    contexts.to_string(),
+                    users.to_string(),
+                ],
+                detail: format!(
+                    "Cluster: {}\nContexts: {}\nUsers: {}\n\nEnter switches to a context that targets this cluster.",
+                    cluster, contexts, users
+                ),
+            });
         }
 
-        self.set_output_overlay(
-            format!("clusters(all)[{}]", clusters.len()),
-            lines.join("\n"),
+        let mut table = TableData::default();
+        table.set_rows(
+            vec![
+                "".to_string(),
+                "Cluster".to_string(),
+                "Contexts".to_string(),
+                "Users".to_string(),
+            ],
+            rows,
+            Local::now(),
+        );
+        table.selected = selected.min(table.rows.len().saturating_sub(1));
+        self.set_catalog_overlay(
+            format!("clusters(all)[{}]", table.rows.len()),
+            CatalogOverlayKind::Clusters,
+            table,
         );
         self.status = "Cluster catalog opened (:cluster <name> to switch)".to_string();
     }
@@ -3265,32 +3643,55 @@ impl App {
         users.sort();
         users.dedup();
 
-        let mut lines = Vec::new();
-        lines.push(format!(
-            "{:<2} {:<34} {:<9} {}",
-            "", "AUTHINFO", "CONTEXTS", "CLUSTERS"
-        ));
+        let mut rows = Vec::new();
+        let mut selected = 0usize;
 
-        if users.is_empty() {
-            lines.push("No users found in kubeconfig".to_string());
-        } else {
-            for user in &users {
-                let (contexts, clusters) = user_map
-                    .get(user)
-                    .map(|(contexts, clusters)| (contexts.len(), clusters.len()))
-                    .unwrap_or((0, 0));
-                let active = if *user == self.user { "*" } else { " " };
-                lines.push(format!(
-                    "{:<2} {:<34} {:<9} {}",
-                    active,
-                    table_cell(user, 34),
-                    contexts,
-                    clusters
-                ));
+        for (index, user) in users.iter().enumerate() {
+            let (contexts, clusters) = user_map
+                .get(user)
+                .map(|(contexts, clusters)| (contexts.len(), clusters.len()))
+                .unwrap_or((0, 0));
+            let active = *user == self.user;
+            if active {
+                selected = index;
             }
+            rows.push(RowData {
+                name: user.clone(),
+                namespace: None,
+                columns: vec![
+                    if active {
+                        "*".to_string()
+                    } else {
+                        String::new()
+                    },
+                    user.clone(),
+                    contexts.to_string(),
+                    clusters.to_string(),
+                ],
+                detail: format!(
+                    "AuthInfo: {}\nContexts: {}\nClusters: {}\n\nEnter switches to a context that uses this auth entry.",
+                    user, contexts, clusters
+                ),
+            });
         }
 
-        self.set_output_overlay(format!("users(all)[{}]", users.len()), lines.join("\n"));
+        let mut table = TableData::default();
+        table.set_rows(
+            vec![
+                "".to_string(),
+                "AuthInfo".to_string(),
+                "Contexts".to_string(),
+                "Clusters".to_string(),
+            ],
+            rows,
+            Local::now(),
+        );
+        table.selected = selected.min(table.rows.len().saturating_sub(1));
+        self.set_catalog_overlay(
+            format!("users(all)[{}]", table.rows.len()),
+            CatalogOverlayKind::Users,
+            table,
+        );
         self.status = "User catalog opened (:usr <name> to switch)".to_string();
     }
 
@@ -3867,7 +4268,7 @@ impl App {
                 return AppCommand::None;
             }
 
-            self.namespace_scope = NamespaceScope::Named(namespace.clone());
+            self.set_namespace_scope_with_reset(NamespaceScope::Named(namespace.clone()));
             self.filter.clear();
             self.clamp_all_selections();
             self.status = format!("Namespace scope set to '{namespace}'");
@@ -4546,12 +4947,21 @@ impl App {
         self.detail_overlay = None;
     }
 
-    fn clear_table_overlay(&mut self) {
+    fn clear_output_overlay(&mut self) {
         self.table_overlay_title = None;
         self.table_overlay = None;
         self.table_overlay_kind = TableOverlayKind::Generic;
         self.table_overlay_return_picker = None;
         self.table_scroll = 0;
+    }
+
+    fn clear_catalog_overlay(&mut self) {
+        self.catalog_overlay = None;
+    }
+
+    fn clear_table_overlay(&mut self) {
+        self.clear_output_overlay();
+        self.clear_catalog_overlay();
     }
 
     fn clear_container_picker(&mut self) {
@@ -4781,6 +5191,31 @@ fn supports_xray(tab: ResourceTab) -> bool {
     )
 }
 
+fn is_namespace_scoped_runtime_tab(tab: ResourceTab) -> bool {
+    matches!(
+        tab,
+        ResourceTab::Pods
+            | ResourceTab::CronJobs
+            | ResourceTab::DaemonSets
+            | ResourceTab::Deployments
+            | ResourceTab::ReplicaSets
+            | ResourceTab::ReplicationControllers
+            | ResourceTab::StatefulSets
+            | ResourceTab::Jobs
+            | ResourceTab::Services
+            | ResourceTab::Ingresses
+            | ResourceTab::ConfigMaps
+            | ResourceTab::PersistentVolumeClaims
+            | ResourceTab::Secrets
+            | ResourceTab::ServiceAccounts
+            | ResourceTab::Roles
+            | ResourceTab::RoleBindings
+            | ResourceTab::NetworkPolicies
+            | ResourceTab::Events
+            | ResourceTab::CustomResources
+    )
+}
+
 fn parse_namespaced_target(input: &str) -> Option<(&str, String)> {
     let (namespace, name) = input.split_once('/')?;
     let namespace = namespace.trim();
@@ -4919,6 +5354,20 @@ fn normalize_status_text(status: String) -> String {
     shortened
 }
 
+fn detect_cluster_argocd(crds: &[CustomResourceDef]) -> ClusterArgoCdState {
+    if crds.iter().any(|crd| {
+        crd.group == "argoproj.io"
+            && matches!(
+                crd.plural.as_str(),
+                "applications" | "appprojects" | "applicationsets"
+            )
+    }) {
+        ClusterArgoCdState::Present
+    } else {
+        ClusterArgoCdState::Absent
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5038,6 +5487,23 @@ mod tests {
             "context".to_string(),
             NamespaceScope::Named("default".to_string()),
         );
+        assert_eq!(app.active_tab(), ResourceTab::Orca);
+    }
+
+    #[test]
+    fn dashboard_command_switches_to_orca_tab() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let _ = app.switch_to_tab(ResourceTab::Pods);
+        app.apply_action(Action::StartCommand);
+        for c in "dashboard".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshActive);
         assert_eq!(app.active_tab(), ResourceTab::Orca);
     }
 
@@ -6016,9 +6482,14 @@ mod tests {
 
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::None);
-        assert!(app.table_overlay_active());
-        assert_eq!(app.pane_label(), "out");
-        assert!(app.table_overlay_text().unwrap_or("").contains("openclaw"));
+        assert!(app.catalog_overlay_active());
+        assert_eq!(app.pane_label(), "tbl");
+        assert_eq!(app.catalog_overlay_title(), Some("contexts(all)[1]"));
+        assert_eq!(app.active_selected_index(), Some(0));
+        assert_eq!(
+            app.active_selected_row().map(|row| row.name.as_str()),
+            Some("openclaw")
+        );
     }
 
     #[test]
@@ -6122,10 +6593,115 @@ mod tests {
 
         let cmd = app.apply_action(Action::SubmitInput);
         assert_eq!(cmd, AppCommand::None);
-        assert!(app.table_overlay_active());
-        let text = app.table_overlay_text().unwrap_or("");
-        assert!(text.contains("openclaw"));
-        assert!(text.contains("robot"));
+        assert!(app.catalog_overlay_active());
+        let rows = app.active_visible_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "openclaw");
+        assert_eq!(rows[1].name, "robot");
+    }
+
+    #[test]
+    fn cluster_catalog_overlay_supports_table_navigation_and_enter() {
+        let mut app = App::new(
+            "https://cluster".to_string(),
+            "openclaw".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_kube_catalog(
+            vec!["openclaw".to_string(), "dev".to_string()],
+            vec!["openclaw".to_string(), "homelab".to_string()],
+            vec!["openclaw".to_string(), "robot".to_string()],
+            vec![
+                ContextCatalogRow {
+                    context: "openclaw".to_string(),
+                    cluster: "openclaw".to_string(),
+                    auth_info: "openclaw".to_string(),
+                    namespace: "openclaw".to_string(),
+                },
+                ContextCatalogRow {
+                    context: "dev".to_string(),
+                    cluster: "homelab".to_string(),
+                    auth_info: "robot".to_string(),
+                    namespace: "ci".to_string(),
+                },
+            ],
+        );
+
+        app.apply_action(Action::StartCommand);
+        for c in "cluster".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::None);
+        assert!(app.catalog_overlay_active());
+        assert_eq!(app.catalog_overlay_title(), Some("clusters(all)[2]"));
+        assert_eq!(
+            app.active_selected_row().map(|row| row.name.as_str()),
+            Some("openclaw")
+        );
+
+        let _ = app.apply_action(Action::Up);
+        assert_eq!(app.active_selected_index(), Some(0));
+        assert_eq!(
+            app.active_selected_row().map(|row| row.name.as_str()),
+            Some("homelab")
+        );
+
+        let cmd = app.apply_action(Action::EnterResource);
+        assert_eq!(
+            cmd,
+            AppCommand::SwitchCluster {
+                cluster: "homelab".to_string()
+            }
+        );
+        assert!(!app.catalog_overlay_active());
+    }
+
+    #[test]
+    fn namespace_scope_reset_clears_namespaced_runtime_tables() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        let now = Local::now();
+
+        let mut pods = TableData::default();
+        pods.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "api-1".to_string(),
+                namespace: Some("default".to_string()),
+                columns: vec!["api-1".to_string()],
+                detail: "kind: Pod".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Pods, pods);
+
+        let mut nodes = TableData::default();
+        nodes.set_rows(
+            vec!["Name".to_string()],
+            vec![RowData {
+                name: "worker-1".to_string(),
+                namespace: None,
+                columns: vec!["worker-1".to_string()],
+                detail: "kind: Node".to_string(),
+            }],
+            now,
+        );
+        app.set_active_table_data(ResourceTab::Nodes, nodes);
+
+        app.apply_action(Action::StartCommand);
+        for c in "ns kube-system".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+
+        let cmd = app.apply_action(Action::SubmitInput);
+        assert_eq!(cmd, AppCommand::RefreshAll);
+        assert_eq!(app.table_row_count_for(ResourceTab::Pods), 0);
+        assert_eq!(app.table_row_count_for(ResourceTab::Nodes), 1);
     }
 
     #[test]
@@ -6152,6 +6728,21 @@ mod tests {
                 .any(|candidate| candidate.starts_with("tab ")),
             "legacy tab-prefix completions should be hidden"
         );
+    }
+
+    #[test]
+    fn command_completion_includes_dashboard_alias() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.apply_action(Action::StartCommand);
+        for c in "dash".chars() {
+            app.apply_action(Action::InputChar(c));
+        }
+        let completions = app.completion_candidates();
+        assert!(completions.iter().any(|candidate| candidate == "dashboard"));
     }
 
     #[test]

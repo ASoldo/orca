@@ -7,7 +7,10 @@ mod model;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{App, AppCommand, ArgoResourcePanelSection, OpsInspectTarget, PluginRun};
+use app::{
+    App, AppCommand, ArgoResourcePanelSection, ClusterArgoCdState, HostToolStatus,
+    OpsInspectTarget, PluginRun,
+};
 use chrono::Local;
 use clap::Parser;
 use cli::CliArgs;
@@ -34,13 +37,13 @@ use k8s_openapi::api::rbac::v1::{ClusterRole, ClusterRoleBinding, Role, RoleBind
 use k8s_openapi::api::storage::v1::StorageClass;
 use kube::runtime::watcher::{Config as WatchConfig, watcher};
 use kube::{Api, Client};
-use model::{NamespaceScope, ResourceTab};
+use model::{AlertSnapshot, CustomResourceDef, NamespaceScope, OverviewMetrics, ResourceTab};
 use model::{RowData, TableData};
 use portable_pty::{CommandBuilder as PtyCommandBuilder, PtySize, native_pty_system};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Stdout, Write};
 use std::net::UdpSocket;
@@ -88,6 +91,225 @@ struct EmbeddedShellState {
     application_cursor: bool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+enum RefreshKey {
+    Tab(ResourceTab),
+    CustomResourceCatalog,
+    HostTools,
+}
+
+#[derive(Debug, Clone)]
+enum RefreshJob {
+    KubernetesTable {
+        epoch: u64,
+        tab: ResourceTab,
+        scope: NamespaceScope,
+        selected_custom: Option<CustomResourceDef>,
+        include_overview: bool,
+    },
+    ArgoTable {
+        epoch: u64,
+        tab: ResourceTab,
+        selected_app: Option<String>,
+    },
+    CustomResourceCatalog {
+        epoch: u64,
+    },
+    HostTools {
+        epoch: u64,
+    },
+}
+
+impl RefreshJob {
+    fn key(&self) -> RefreshKey {
+        match self {
+            Self::KubernetesTable { tab, .. } | Self::ArgoTable { tab, .. } => {
+                RefreshKey::Tab(*tab)
+            }
+            Self::CustomResourceCatalog { .. } => RefreshKey::CustomResourceCatalog,
+            Self::HostTools { .. } => RefreshKey::HostTools,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RefreshValue<T> {
+    Ready(T),
+    Failed(String),
+    TimedOut(String),
+}
+
+#[derive(Debug)]
+enum RefreshOutcome {
+    KubernetesTable {
+        epoch: u64,
+        tab: ResourceTab,
+        selected_custom: Option<String>,
+        table: RefreshValue<TableData>,
+        metrics: Option<RefreshValue<OverviewMetrics>>,
+        alerts: Option<RefreshValue<AlertSnapshot>>,
+    },
+    ArgoTable {
+        epoch: u64,
+        tab: ResourceTab,
+        selected_app: Option<String>,
+        server: Option<String>,
+        table: std::result::Result<TableData, String>,
+        status: Option<String>,
+    },
+    CustomResourceCatalog {
+        epoch: u64,
+        result: RefreshValue<Vec<CustomResourceDef>>,
+    },
+    HostTools {
+        epoch: u64,
+        tools: Vec<HostToolStatus>,
+    },
+}
+
+#[derive(Default)]
+struct RefreshPipeline {
+    epoch: u64,
+    queue: VecDeque<RefreshJob>,
+    queued: HashSet<RefreshKey>,
+    task: Option<(RefreshKey, JoinHandle<RefreshOutcome>)>,
+}
+
+impl RefreshPipeline {
+    fn enqueue_bootstrap(&mut self, app: &App) {
+        self.enqueue_host_tools();
+        self.enqueue_custom_resource_catalog();
+        self.enqueue_tab(app, ResourceTab::Namespaces);
+        self.enqueue_tab(app, ResourceTab::Nodes);
+        self.enqueue_tab(app, ResourceTab::Pods);
+        self.enqueue_tab(app, ResourceTab::CustomResources);
+        self.enqueue_cluster_argocd(app);
+
+        if app.active_tab() != ResourceTab::Orca {
+            self.enqueue_tab(app, app.active_tab());
+        }
+    }
+
+    fn enqueue_active(&mut self, app: &App) {
+        match app.active_tab() {
+            ResourceTab::Orca => {
+                self.enqueue_tab(app, ResourceTab::Namespaces);
+                self.enqueue_tab(app, ResourceTab::Nodes);
+                self.enqueue_tab(app, ResourceTab::Pods);
+                self.enqueue_tab(app, ResourceTab::CustomResources);
+                self.enqueue_cluster_argocd(app);
+            }
+            tab => self.enqueue_tab(app, tab),
+        }
+    }
+
+    fn enqueue_all(&mut self, app: &App) {
+        self.enqueue_host_tools();
+        self.enqueue_custom_resource_catalog();
+        for tab in app.tabs() {
+            if is_argocd_tab(*tab) && !app.cluster_has_argocd() && app.active_tab() != *tab {
+                continue;
+            }
+            self.enqueue_tab(app, *tab);
+        }
+    }
+
+    fn enqueue_custom_resource_catalog(&mut self) {
+        self.enqueue_job(RefreshJob::CustomResourceCatalog { epoch: self.epoch });
+    }
+
+    fn enqueue_host_tools(&mut self) {
+        self.enqueue_job(RefreshJob::HostTools { epoch: self.epoch });
+    }
+
+    fn enqueue_cluster_argocd(&mut self, app: &App) {
+        if !app.cluster_has_argocd() {
+            return;
+        }
+        self.enqueue_tab(app, ResourceTab::ArgoCdApps);
+        if current_argocd_selection(app).is_some() {
+            self.enqueue_tab(app, ResourceTab::ArgoCdResources);
+        }
+    }
+
+    fn enqueue_tab(&mut self, app: &App, tab: ResourceTab) {
+        if let Some(job) = self.build_tab_job(app, tab) {
+            self.enqueue_job(job);
+        }
+    }
+
+    fn build_tab_job(&self, app: &App, tab: ResourceTab) -> Option<RefreshJob> {
+        match tab {
+            ResourceTab::Orca => None,
+            ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys => Some(RefreshJob::ArgoTable {
+                epoch: self.epoch,
+                tab,
+                selected_app: current_argocd_selection(app),
+            }),
+            _ => Some(RefreshJob::KubernetesTable {
+                epoch: self.epoch,
+                tab,
+                scope: app.namespace_scope().clone(),
+                selected_custom: app.selected_custom_resource().cloned(),
+                include_overview: tab == app.active_tab(),
+            }),
+        }
+    }
+
+    fn enqueue_job(&mut self, job: RefreshJob) {
+        let key = job.key();
+        if self.queued.insert(key) {
+            self.queue.push_back(job);
+        }
+    }
+
+    fn advance_epoch(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+        self.clear();
+    }
+
+    fn clear(&mut self) {
+        if let Some((_, task)) = self.task.take() {
+            task.abort();
+        }
+        self.queue.clear();
+        self.queued.clear();
+    }
+
+    fn maybe_start(&mut self, gateway: &KubeGateway) {
+        if self.task.is_some() {
+            return;
+        }
+
+        let Some(job) = self.queue.pop_front() else {
+            return;
+        };
+        let key = job.key();
+        let gateway = gateway.clone();
+        self.task = Some((
+            key,
+            tokio::spawn(async move { run_refresh_job(gateway, job).await }),
+        ));
+    }
+
+    fn finish_current(&mut self) {
+        if let Some((key, _)) = self.task.take() {
+            self.queued.remove(&key);
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.task.is_none() && self.queue.is_empty()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = CliArgs::parse();
@@ -110,6 +332,7 @@ async fn main() -> Result<()> {
     app.set_user(gateway.user().to_string());
     let (host_user, host_name, host_ip) = resolve_host_identity();
     app.set_host_identity(host_user, host_name, host_ip);
+    app.set_host_tools_silent(placeholder_host_tools());
     app.set_kube_catalog(
         gateway.available_contexts(),
         gateway.available_clusters(),
@@ -190,6 +413,366 @@ fn resolve_local_ip() -> Option<String> {
     }
 }
 
+fn current_argocd_selection(app: &App) -> Option<String> {
+    app.argocd_selected_app()
+        .map(str::to_string)
+        .or_else(|| app.selected_row_name_for(ResourceTab::ArgoCdApps))
+}
+
+fn is_argocd_tab(tab: ResourceTab) -> bool {
+    matches!(
+        tab,
+        ResourceTab::ArgoCdApps
+            | ResourceTab::ArgoCdResources
+            | ResourceTab::ArgoCdProjects
+            | ResourceTab::ArgoCdRepos
+            | ResourceTab::ArgoCdClusters
+            | ResourceTab::ArgoCdAccounts
+            | ResourceTab::ArgoCdCerts
+            | ResourceTab::ArgoCdGpgKeys
+    )
+}
+
+fn refresh_orca_dashboard(app: &mut App) {
+    let status = app.status_text().to_string();
+    let table = build_orca_dashboard_table(app);
+    app.set_active_table_data(ResourceTab::Orca, table);
+    app.set_status(status);
+}
+
+fn bootstrap_dashboard_ready(app: &App) -> bool {
+    app.host_tool_pending_count() == 0
+        && app.table_loaded_for(ResourceTab::Namespaces)
+        && app.table_loaded_for(ResourceTab::Nodes)
+        && app.table_loaded_for(ResourceTab::Pods)
+        && app.table_loaded_for(ResourceTab::CustomResources)
+}
+
+fn finalize_bootstrap_status(app: &mut App, refresh_pipeline: &RefreshPipeline) {
+    if app.status_text() == "Bootstrapping Kubernetes data…"
+        && (bootstrap_dashboard_ready(app) || refresh_pipeline.is_idle())
+    {
+        app.set_status("Dashboard ready");
+    }
+}
+
+async fn run_refresh_job(gateway: KubeGateway, job: RefreshJob) -> RefreshOutcome {
+    match job {
+        RefreshJob::KubernetesTable {
+            epoch,
+            tab,
+            scope,
+            selected_custom,
+            include_overview,
+        } => {
+            let selected_custom_name = selected_custom.as_ref().map(|crd| crd.name.clone());
+            let table = match timeout(
+                TABLE_REFRESH_TIMEOUT,
+                gateway.fetch_table(tab, &scope, selected_custom.as_ref()),
+            )
+            .await
+            {
+                Ok(Ok(table)) => RefreshValue::Ready(table),
+                Ok(Err(error)) => RefreshValue::Failed(compact_error(&error)),
+                Err(_) => RefreshValue::TimedOut(format!(
+                    "Refresh timed out for {} (showing cached data)",
+                    tab.title()
+                )),
+            };
+
+            let metrics = if include_overview {
+                Some(
+                    match timeout(
+                        METRICS_REFRESH_TIMEOUT,
+                        gateway.fetch_overview_metrics(&scope),
+                    )
+                    .await
+                    {
+                        Ok(Ok(metrics)) => RefreshValue::Ready(metrics),
+                        Ok(Err(error)) => RefreshValue::Failed(format!(
+                            "Metrics refresh failed for {}: {}",
+                            tab.title(),
+                            compact_error(&error)
+                        )),
+                        Err(_) => RefreshValue::TimedOut(format!(
+                            "Metrics refresh timed out for {} (using cached)",
+                            tab.title()
+                        )),
+                    },
+                )
+            } else {
+                None
+            };
+
+            let alerts = if include_overview {
+                Some(
+                    match timeout(
+                        METRICS_REFRESH_TIMEOUT,
+                        gateway.fetch_alert_snapshot(&scope),
+                    )
+                    .await
+                    {
+                        Ok(Ok(snapshot)) => RefreshValue::Ready(snapshot),
+                        Ok(Err(error)) => RefreshValue::Failed(format!(
+                            "alert snapshot refresh failed for {}: {error:#}",
+                            tab.title()
+                        )),
+                        Err(_) => RefreshValue::TimedOut(format!(
+                            "alert snapshot refresh timed out for {}",
+                            tab.title()
+                        )),
+                    },
+                )
+            } else {
+                None
+            };
+
+            RefreshOutcome::KubernetesTable {
+                epoch,
+                tab,
+                selected_custom: selected_custom_name,
+                table,
+                metrics,
+                alerts,
+            }
+        }
+        RefreshJob::ArgoTable {
+            epoch,
+            tab,
+            selected_app,
+        } => {
+            let server = fetch_argocd_server().await;
+            let (table, status) = match tab {
+                ResourceTab::ArgoCdApps => match fetch_argocd_apps_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdResources => {
+                    if let Some(app_name) = selected_app.clone() {
+                        match fetch_argocd_resources_table(&app_name).await {
+                            Ok(table) => (Ok(table), None),
+                            Err(error) => (Err(error), None),
+                        }
+                    } else {
+                        (
+                            Ok(empty_argocd_resources_table()),
+                            Some("Select an Argo CD app first (Enter on ArgoApps)".to_string()),
+                        )
+                    }
+                }
+                ResourceTab::ArgoCdProjects => match fetch_argocd_projects_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdRepos => match fetch_argocd_repos_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdClusters => match fetch_argocd_clusters_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdAccounts => match fetch_argocd_accounts_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdCerts => match fetch_argocd_certs_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                ResourceTab::ArgoCdGpgKeys => match fetch_argocd_gpg_table().await {
+                    Ok(table) => (Ok(table), None),
+                    Err(error) => (Err(error), None),
+                },
+                _ => (Err(format!("unsupported Argo tab: {}", tab.title())), None),
+            };
+
+            RefreshOutcome::ArgoTable {
+                epoch,
+                tab,
+                selected_app,
+                server,
+                table,
+                status,
+            }
+        }
+        RefreshJob::CustomResourceCatalog { epoch } => {
+            let result = match timeout(CRD_DISCOVERY_TIMEOUT, gateway.discover_custom_resources())
+                .await
+            {
+                Ok(Ok(crds)) => RefreshValue::Ready(crds),
+                Ok(Err(error)) => RefreshValue::Failed(format!("CRD discovery failed: {error:#}")),
+                Err(_) => {
+                    RefreshValue::TimedOut("CRD discovery timed out (using cached)".to_string())
+                }
+            };
+            RefreshOutcome::CustomResourceCatalog { epoch, result }
+        }
+        RefreshJob::HostTools { epoch } => RefreshOutcome::HostTools {
+            epoch,
+            tools: load_host_tools().await,
+        },
+    }
+}
+
+fn empty_argocd_resources_table() -> TableData {
+    let mut table = TableData::default();
+    table.set_rows(
+        vec![
+            "Kind".to_string(),
+            "Namespace".to_string(),
+            "Name".to_string(),
+            "Sync".to_string(),
+            "Health".to_string(),
+            "Hook".to_string(),
+            "Wave".to_string(),
+        ],
+        Vec::new(),
+        Local::now(),
+    );
+    table
+}
+
+#[derive(Default)]
+struct RefreshFollowUp {
+    enqueue_cluster_argocd: bool,
+}
+
+fn apply_refresh_outcome(
+    app: &mut App,
+    outcome: RefreshOutcome,
+    active_epoch: u64,
+) -> RefreshFollowUp {
+    let mut follow_up = RefreshFollowUp::default();
+    match outcome {
+        RefreshOutcome::KubernetesTable {
+            epoch,
+            tab,
+            selected_custom,
+            table,
+            metrics,
+            alerts,
+        } => {
+            if epoch != active_epoch {
+                return follow_up;
+            }
+            if tab == ResourceTab::CustomResources
+                && app.selected_custom_resource().map(|crd| crd.name.as_str())
+                    != selected_custom.as_deref()
+            {
+                return follow_up;
+            }
+
+            match table {
+                RefreshValue::Ready(table) => {
+                    app.set_active_table_data_silent(tab, table);
+                    if let Some(metrics) = metrics {
+                        match metrics {
+                            RefreshValue::Ready(metrics) => app.set_overview_metrics(metrics),
+                            RefreshValue::Failed(message) | RefreshValue::TimedOut(message) => {
+                                app.set_status(message);
+                            }
+                        }
+                    }
+                    if let Some(alerts) = alerts {
+                        match alerts {
+                            RefreshValue::Ready(snapshot) => app.set_alert_snapshot(snapshot),
+                            RefreshValue::Failed(message) | RefreshValue::TimedOut(message) => {
+                                debug!("{message}");
+                            }
+                        }
+                    }
+                }
+                RefreshValue::Failed(error) => app.set_active_tab_error(tab, error),
+                RefreshValue::TimedOut(message) => app.set_status(message),
+            }
+
+            if matches!(
+                tab,
+                ResourceTab::Namespaces
+                    | ResourceTab::Nodes
+                    | ResourceTab::Pods
+                    | ResourceTab::CustomResources
+            ) {
+                refresh_orca_dashboard(app);
+            }
+        }
+        RefreshOutcome::ArgoTable {
+            epoch,
+            tab,
+            selected_app,
+            server,
+            table,
+            status,
+        } => {
+            if epoch != active_epoch {
+                return follow_up;
+            }
+            if tab == ResourceTab::ArgoCdResources
+                && current_argocd_selection(app).as_deref() != selected_app.as_deref()
+            {
+                return follow_up;
+            }
+
+            if let Some(server) = server {
+                app.set_argocd_server(server);
+            }
+
+            match table {
+                Ok(table) => {
+                    if matches!(tab, ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources) {
+                        app.set_argocd_selected_app(selected_app.clone());
+                    }
+                    app.set_active_table_data_silent(tab, table);
+                    if tab == ResourceTab::ArgoCdApps
+                        && let Some(selected_app) =
+                            app.selected_row_name_for(ResourceTab::ArgoCdApps)
+                    {
+                        app.set_argocd_selected_app(Some(selected_app));
+                    }
+                    if let Some(status) = status {
+                        app.set_status(status);
+                    }
+                }
+                Err(error) => app.set_active_tab_error(tab, error),
+            }
+
+            if matches!(tab, ResourceTab::ArgoCdApps | ResourceTab::ArgoCdResources) {
+                refresh_orca_dashboard(app);
+            }
+        }
+        RefreshOutcome::CustomResourceCatalog { epoch, result } => {
+            if epoch != active_epoch {
+                return follow_up;
+            }
+            let had_cluster_argocd = app.cluster_has_argocd();
+            match result {
+                RefreshValue::Ready(crds) => {
+                    app.set_custom_resources_silent(crds);
+                    if !had_cluster_argocd
+                        && app.cluster_has_argocd()
+                        && app.active_tab() == ResourceTab::Orca
+                    {
+                        follow_up.enqueue_cluster_argocd = true;
+                    }
+                }
+                RefreshValue::Failed(message) | RefreshValue::TimedOut(message) => {
+                    app.set_status(message);
+                }
+            }
+            refresh_orca_dashboard(app);
+        }
+        RefreshOutcome::HostTools { epoch, tools } => {
+            if epoch != active_epoch {
+                return follow_up;
+            }
+            app.set_host_tools_silent(tools);
+            refresh_orca_dashboard(app);
+        }
+    }
+    follow_up
+}
+
 async fn run(app: &mut App, gateway: &mut KubeGateway, refresh_ms: u64) -> Result<()> {
     let (mut terminal, keyboard_enhanced) = init_terminal()?;
     let run_result = run_loop(&mut terminal, app, gateway, refresh_ms).await;
@@ -268,13 +851,11 @@ async fn run_loop(
         }
     }
 
-    refresh_custom_resource_catalog(app, gateway).await;
-    refresh_tab(app, gateway, ResourceTab::Namespaces).await;
-    refresh_tab(app, gateway, ResourceTab::Nodes).await;
-    refresh_tab(app, gateway, ResourceTab::Pods).await;
-    refresh_tab(app, gateway, ResourceTab::ArgoCdApps).await;
-    refresh_tab(app, gateway, app.active_tab()).await;
-    refresh_tab(app, gateway, ResourceTab::CustomResources).await;
+    let bootstrap_status = app.status_text().to_string();
+    refresh_orca_dashboard(app);
+    app.set_status(bootstrap_status);
+    let mut refresh_pipeline = RefreshPipeline::default();
+    refresh_pipeline.enqueue_bootstrap(app);
 
     let mut reader = EventStream::new();
     let mut ticker = interval(Duration::from_millis(refresh_ms));
@@ -287,6 +868,8 @@ async fn run_loop(
     let mut embedded_shell = EmbeddedShellState::default();
 
     loop {
+        refresh_pipeline.maybe_start(gateway);
+        finalize_bootstrap_status(app, &refresh_pipeline);
         terminal
             .draw(|frame| ui::render(frame, app))
             .context("failed to render terminal frame")?;
@@ -324,6 +907,7 @@ async fn run_loop(
                                     terminal,
                                     app,
                                     gateway,
+                                    &mut refresh_pipeline,
                                     command,
                                     &pf_tx,
                                     &shell_output_tx,
@@ -356,6 +940,7 @@ async fn run_loop(
                                     terminal,
                                     app,
                                     gateway,
+                                    &mut refresh_pipeline,
                                     command,
                                     &pf_tx,
                                     &shell_output_tx,
@@ -378,6 +963,27 @@ async fn run_loop(
                     None => {
                         app.set_status("terminal event stream closed");
                         break;
+                    }
+                }
+            }
+            refresh_result = async {
+                let (_, task) = refresh_pipeline.task.as_mut().expect("refresh task is present");
+                task.await
+            }, if refresh_pipeline.task.is_some() => {
+                let result = refresh_result;
+                refresh_pipeline.finish_current();
+                match result {
+                    Ok(outcome) => {
+                        let follow_up = apply_refresh_outcome(app, outcome, refresh_pipeline.epoch);
+                        if follow_up.enqueue_cluster_argocd {
+                            refresh_pipeline.enqueue_cluster_argocd(app);
+                        }
+                        finalize_bootstrap_status(app, &refresh_pipeline);
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        warn!("background refresh task failed: {error}");
+                        app.set_status("Background refresh task failed");
                     }
                 }
             }
@@ -408,8 +1014,7 @@ async fn run_loop(
                     }
                 }
 
-                let active = app.active_tab();
-                refresh_tab(app, gateway, active).await;
+                refresh_pipeline.enqueue_active(app);
 
                 let mut should_reset_shell = false;
                 if let Some(child) = embedded_shell.child.as_mut() {
@@ -438,7 +1043,7 @@ async fn run_loop(
                 if let Some(tab) = maybe_tab
                     && should_process_watch_event(tab, &mut watch_throttle)
                     && (tab == app.active_tab() || tab == ResourceTab::Namespaces) {
-                    refresh_tab(app, gateway, tab).await;
+                    refresh_pipeline.enqueue_tab(app, tab);
                 }
             }
             maybe_event = pf_rx.recv() => {
@@ -479,6 +1084,7 @@ async fn run_loop(
         }
     }
 
+    refresh_pipeline.clear();
     stop_embedded_shell(&mut embedded_shell).await;
     Ok(())
 }
@@ -487,6 +1093,7 @@ async fn execute_app_command(
     terminal: &mut TuiTerminal,
     app: &mut App,
     gateway: &mut KubeGateway,
+    refresh_pipeline: &mut RefreshPipeline,
     command: AppCommand,
     pf_tx: &mpsc::UnboundedSender<PortForwardExitEvent>,
     shell_output_tx: &mpsc::UnboundedSender<ShellOutputEvent>,
@@ -495,19 +1102,18 @@ async fn execute_app_command(
     match command {
         AppCommand::None => {}
         AppCommand::RefreshActive => {
-            let tab = app.active_tab();
-            refresh_tab(app, gateway, tab).await;
+            if app.active_tab() == ResourceTab::Orca {
+                refresh_pipeline.enqueue_host_tools();
+            }
+            refresh_pipeline.enqueue_active(app);
         }
         AppCommand::RefreshAll => {
-            let tabs = app.tabs().to_vec();
-            for tab in tabs {
-                refresh_tab(app, gateway, tab).await;
-            }
+            refresh_pipeline.enqueue_all(app);
         }
         AppCommand::RefreshCustomResourceCatalog => {
-            refresh_custom_resource_catalog(app, gateway).await;
+            refresh_pipeline.enqueue_custom_resource_catalog();
             if app.active_tab() == ResourceTab::CustomResources {
-                refresh_tab(app, gateway, ResourceTab::CustomResources).await;
+                refresh_pipeline.enqueue_tab(app, ResourceTab::CustomResources);
             }
         }
         AppCommand::LoadPodLogs {
@@ -710,7 +1316,7 @@ async fn execute_app_command(
                     }
                     None => app.set_status(format!("Deleted {} {}", tab.title(), name)),
                 }
-                refresh_tab(app, gateway, tab).await;
+                refresh_pipeline.enqueue_tab(app, tab);
             }
             Err(error) => app.set_status(format!(
                 "Delete failed for {} {}: {error:#}",
@@ -730,7 +1336,7 @@ async fn execute_app_command(
                     namespace,
                     name
                 ));
-                refresh_tab(app, gateway, tab).await;
+                refresh_pipeline.enqueue_tab(app, tab);
             }
             Err(error) => app.set_status(format!(
                 "Restart failed for {} {}/{}: {error:#}",
@@ -756,7 +1362,7 @@ async fn execute_app_command(
                     name,
                     replicas
                 ));
-                refresh_tab(app, gateway, tab).await;
+                refresh_pipeline.enqueue_tab(app, tab);
             }
             Err(error) => app.set_status(format!(
                 "Scale failed for {} {}/{}: {error:#}",
@@ -822,7 +1428,7 @@ async fn execute_app_command(
                     Some(namespace) => format!("Edited {resource} {namespace}/{name}"),
                     None => format!("Edited {resource} {name}"),
                 });
-                refresh_tab(app, gateway, app.active_tab()).await;
+                refresh_pipeline.enqueue_active(app);
             }
             Err(error) => app.set_status(format!("Edit failed for {resource} {name}: {error:#}")),
         },
@@ -878,9 +1484,13 @@ async fn execute_app_command(
             }
         }
         AppCommand::InspectTooling => {
-            let report = inspect_toolchain().await;
+            let preserve_status = app.status_text().ends_with("not available on this host");
+            let report = render_tool_inventory_report(app.host_tools());
             app.set_output_overlay("Toolchain Inventory", report);
-            app.set_status("Toolchain inventory refreshed");
+            if !preserve_status {
+                app.set_status("Toolchain inventory opened");
+            }
+            refresh_pipeline.enqueue_host_tools();
         }
         AppCommand::InspectPulses => match gateway.fetch_pulses_report(app.namespace_scope()).await
         {
@@ -914,7 +1524,7 @@ async fn execute_app_command(
                     | OpsInspectTarget::ArgoCdRollback { .. }
                     | OpsInspectTarget::ArgoCdDelete { .. }
             ) {
-                refresh_tab(app, gateway, ResourceTab::ArgoCdApps).await;
+                refresh_pipeline.enqueue_tab(app, ResourceTab::ArgoCdApps);
                 if matches!(
                     app.active_tab(),
                     ResourceTab::ArgoCdResources
@@ -926,8 +1536,7 @@ async fn execute_app_command(
                         | ResourceTab::ArgoCdCerts
                         | ResourceTab::ArgoCdGpgKeys
                 ) {
-                    let active = app.active_tab();
-                    refresh_tab(app, gateway, active).await;
+                    refresh_pipeline.enqueue_active(app);
                 }
             }
         }
@@ -980,11 +1589,10 @@ async fn execute_app_command(
                     gateway.available_users(),
                     gateway.context_catalog(),
                 );
-                refresh_custom_resource_catalog(app, gateway).await;
-                let tabs = app.tabs().to_vec();
-                for tab in tabs {
-                    refresh_tab(app, gateway, tab).await;
-                }
+                app.reset_cluster_runtime_state();
+                refresh_orca_dashboard(app);
+                refresh_pipeline.advance_epoch();
+                refresh_pipeline.enqueue_bootstrap(app);
                 app.set_status(format!(
                     "Switched context to '{}' ({})",
                     gateway.context(),
@@ -1011,11 +1619,10 @@ async fn execute_app_command(
                     gateway.available_users(),
                     gateway.context_catalog(),
                 );
-                refresh_custom_resource_catalog(app, gateway).await;
-                let tabs = app.tabs().to_vec();
-                for tab in tabs {
-                    refresh_tab(app, gateway, tab).await;
-                }
+                app.reset_cluster_runtime_state();
+                refresh_orca_dashboard(app);
+                refresh_pipeline.advance_epoch();
+                refresh_pipeline.enqueue_bootstrap(app);
                 app.set_status(format!(
                     "Switched cluster '{}' via context '{}' ({})",
                     cluster,
@@ -1043,11 +1650,10 @@ async fn execute_app_command(
                     gateway.available_users(),
                     gateway.context_catalog(),
                 );
-                refresh_custom_resource_catalog(app, gateway).await;
-                let tabs = app.tabs().to_vec();
-                for tab in tabs {
-                    refresh_tab(app, gateway, tab).await;
-                }
+                app.reset_cluster_runtime_state();
+                refresh_orca_dashboard(app);
+                refresh_pipeline.advance_epoch();
+                refresh_pipeline.enqueue_bootstrap(app);
                 app.set_status(format!(
                     "Switched user '{}' via context '{}' ({})",
                     user,
@@ -1063,81 +1669,114 @@ async fn execute_app_command(
     LoopEffect::None
 }
 
+#[derive(Debug, Clone, Copy)]
 struct ToolProbe {
+    key: &'static str,
+    label: &'static str,
+    icon: &'static str,
     name: &'static str,
     program: &'static str,
     args: &'static [&'static str],
 }
 
-async fn inspect_toolchain() -> String {
-    let probes = [
-        ToolProbe {
-            name: "kubectl",
-            program: "kubectl",
-            args: &["version", "--client=true"],
-        },
-        ToolProbe {
-            name: "oc",
-            program: "oc",
-            args: &["version", "--client=true"],
-        },
-        ToolProbe {
-            name: "helm",
-            program: "helm",
-            args: &["version", "--short"],
-        },
-        ToolProbe {
-            name: "argocd",
-            program: "argocd",
-            args: &["version", "--client", "--short"],
-        },
-        ToolProbe {
-            name: "terraform",
-            program: "terraform",
-            args: &["version"],
-        },
-        ToolProbe {
-            name: "ansible-playbook",
-            program: "ansible-playbook",
-            args: &["--version"],
-        },
-        ToolProbe {
-            name: "docker",
-            program: "docker",
-            args: &["--version"],
-        },
-        ToolProbe {
-            name: "git",
-            program: "git",
-            args: &["--version"],
-        },
-        ToolProbe {
-            name: "kustomize",
-            program: "kustomize",
-            args: &["version"],
-        },
-        ToolProbe {
-            name: "kubectl-who-can",
-            program: "kubectl-who-can",
-            args: &["--help"],
-        },
-    ];
+const HOST_TOOL_PROBES: &[ToolProbe] = &[
+    ToolProbe {
+        key: "kubectl",
+        label: "Kubectl",
+        icon: "󱃾",
+        name: "kubectl",
+        program: "kubectl",
+        args: &["version", "--client=true"],
+    },
+    ToolProbe {
+        key: "oc",
+        label: "OpenShift",
+        icon: "󱃾",
+        name: "oc",
+        program: "oc",
+        args: &["version", "--client=true"],
+    },
+    ToolProbe {
+        key: "helm",
+        label: "Helm",
+        icon: "󰠰",
+        name: "helm",
+        program: "helm",
+        args: &["version", "--short"],
+    },
+    ToolProbe {
+        key: "argocd",
+        label: "Argo CD CLI",
+        icon: "󰀶",
+        name: "argocd",
+        program: "argocd",
+        args: &["version", "--client", "--short"],
+    },
+    ToolProbe {
+        key: "terraform",
+        label: "Terraform",
+        icon: "󱁢",
+        name: "terraform",
+        program: "terraform",
+        args: &["version"],
+    },
+    ToolProbe {
+        key: "ansible-playbook",
+        label: "Ansible",
+        icon: "󱂚",
+        name: "ansible-playbook",
+        program: "ansible-playbook",
+        args: &["--version"],
+    },
+    ToolProbe {
+        key: "docker",
+        label: "Docker",
+        icon: "󰡨",
+        name: "docker",
+        program: "docker",
+        args: &["--version"],
+    },
+    ToolProbe {
+        key: "git",
+        label: "Git",
+        icon: "󰊤",
+        name: "git",
+        program: "git",
+        args: &["--version"],
+    },
+    ToolProbe {
+        key: "kustomize",
+        label: "Kustomize",
+        icon: "󰚜",
+        name: "kustomize",
+        program: "kustomize",
+        args: &["version"],
+    },
+    ToolProbe {
+        key: "kubectl-who-can",
+        label: "Who Can",
+        icon: "󰌵",
+        name: "kubectl-who-can",
+        program: "kubectl-who-can",
+        args: &["--help"],
+    },
+];
 
+fn render_tool_inventory_report(tools: &[HostToolStatus]) -> String {
     let mut lines = vec![format!("{:<18} {:<10} {}", "TOOL", "STATUS", "DETAIL")];
-    for probe in probes {
-        match probe_tool_version(&probe).await {
-            Ok(detail) => lines.push(format!(
+    if tools.is_empty() {
+        lines.push(format!(
+            "{:<18} {:<10} {}",
+            "(loading)", "pending", "tool inventory refresh is still running"
+        ));
+    } else {
+        for tool in tools {
+            lines.push(format!(
                 "{:<18} {:<10} {}",
-                probe.name,
-                "ok",
-                fit_text(&detail, 120)
-            )),
-            Err(error) => lines.push(format!(
-                "{:<18} {:<10} {}",
-                probe.name,
-                "missing",
-                fit_text(&error, 120)
-            )),
+                tool.command,
+                if tool.available { "ok" } else { "missing" },
+                fit_text(&tool.summary, 120)
+            ));
         }
     }
 
@@ -1152,6 +1791,51 @@ async fn inspect_toolchain() -> String {
             .to_string(),
     );
     lines.join("\n")
+}
+
+fn placeholder_host_tools() -> Vec<HostToolStatus> {
+    HOST_TOOL_PROBES
+        .iter()
+        .map(|probe| HostToolStatus {
+            key: probe.key.to_string(),
+            label: probe.label.to_string(),
+            icon: probe.icon.to_string(),
+            command: probe.name.to_string(),
+            available: false,
+            summary: "probe pending".to_string(),
+        })
+        .collect()
+}
+
+async fn load_host_tools() -> Vec<HostToolStatus> {
+    let mut results = futures::stream::iter(HOST_TOOL_PROBES.iter().copied().enumerate())
+        .map(|(index, probe)| async move { (index, probe_host_tool(probe).await) })
+        .buffer_unordered(6)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, tool)| tool).collect()
+}
+
+async fn probe_host_tool(probe: ToolProbe) -> HostToolStatus {
+    match probe_tool_version(&probe).await {
+        Ok(summary) => HostToolStatus {
+            key: probe.key.to_string(),
+            label: probe.label.to_string(),
+            icon: probe.icon.to_string(),
+            command: probe.name.to_string(),
+            available: true,
+            summary,
+        },
+        Err(error) => HostToolStatus {
+            key: probe.key.to_string(),
+            label: probe.label.to_string(),
+            icon: probe.icon.to_string(),
+            command: probe.name.to_string(),
+            available: false,
+            summary: error,
+        },
+    }
 }
 
 async fn probe_tool_version(probe: &ToolProbe) -> std::result::Result<String, String> {
@@ -2266,104 +2950,6 @@ fn discover_ansible_playbooks(root: &str, max_depth: usize, max_files: usize) ->
     found
 }
 
-async fn refresh_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
-    if tab == ResourceTab::Orca {
-        refresh_kubernetes_tab(app, gateway, ResourceTab::Namespaces).await;
-        refresh_kubernetes_tab(app, gateway, ResourceTab::Nodes).await;
-        refresh_kubernetes_tab(app, gateway, ResourceTab::Pods).await;
-        refresh_kubernetes_tab(app, gateway, ResourceTab::CustomResources).await;
-        refresh_argocd_tab(app, ResourceTab::ArgoCdApps).await;
-        if app.argocd_selected_app().is_some() {
-            refresh_argocd_tab(app, ResourceTab::ArgoCdResources).await;
-        }
-        let table = build_orca_dashboard_table(app);
-        app.set_active_table_data(tab, table);
-        app.set_status("ORCA control graph refreshed");
-        return;
-    }
-
-    if matches!(
-        tab,
-        ResourceTab::ArgoCdApps
-            | ResourceTab::ArgoCdResources
-            | ResourceTab::ArgoCdProjects
-            | ResourceTab::ArgoCdRepos
-            | ResourceTab::ArgoCdClusters
-            | ResourceTab::ArgoCdAccounts
-            | ResourceTab::ArgoCdCerts
-            | ResourceTab::ArgoCdGpgKeys
-    ) {
-        refresh_argocd_tab(app, tab).await;
-        return;
-    }
-
-    refresh_kubernetes_tab(app, gateway, tab).await;
-}
-
-async fn refresh_kubernetes_tab(app: &mut App, gateway: &KubeGateway, tab: ResourceTab) {
-    if matches!(tab, ResourceTab::Orca) {
-        return;
-    }
-
-    let scope = app.namespace_scope().clone();
-    let selected_custom = app.selected_custom_resource().cloned();
-    match timeout(
-        TABLE_REFRESH_TIMEOUT,
-        gateway.fetch_table(tab, &scope, selected_custom.as_ref()),
-    )
-    .await
-    {
-        Ok(Ok(table)) => {
-            app.set_active_table_data(tab, table);
-            if tab == app.active_tab() {
-                match timeout(
-                    METRICS_REFRESH_TIMEOUT,
-                    gateway.fetch_overview_metrics(&scope),
-                )
-                .await
-                {
-                    Ok(Ok(metrics)) => app.set_overview_metrics(metrics),
-                    Ok(Err(error)) => {
-                        app.set_status(format!(
-                            "Metrics refresh failed for {}: {}",
-                            tab.title(),
-                            compact_error(&error)
-                        ));
-                    }
-                    Err(_) => {
-                        app.set_status(format!(
-                            "Metrics refresh timed out for {} (using cached)",
-                            tab.title()
-                        ));
-                    }
-                }
-                match timeout(
-                    METRICS_REFRESH_TIMEOUT,
-                    gateway.fetch_alert_snapshot(&scope),
-                )
-                .await
-                {
-                    Ok(Ok(snapshot)) => app.set_alert_snapshot(snapshot),
-                    Ok(Err(error)) => {
-                        debug!(
-                            "alert snapshot refresh failed for {}: {error:#}",
-                            tab.title()
-                        )
-                    }
-                    Err(_) => debug!("alert snapshot refresh timed out for {}", tab.title()),
-                }
-            }
-        }
-        Ok(Err(error)) => app.set_active_tab_error(tab, compact_error(&error)),
-        Err(_) => {
-            app.set_status(format!(
-                "Refresh timed out for {} (showing cached data)",
-                tab.title()
-            ));
-        }
-    }
-}
-
 fn build_orca_dashboard_table(app: &App) -> TableData {
     let k8s_clusters = app.kube_cluster_count();
     let k8s_contexts = app.kube_context_count();
@@ -2375,13 +2961,133 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
     let argo_apps = app.table_row_count_for(ResourceTab::ArgoCdApps);
     let argo_resources = app.table_row_count_for(ResourceTab::ArgoCdResources);
     let argo_server = app.argocd_server();
-    let argo_state = if argo_server == "-" {
+    let cluster_argocd_state = app.cluster_argocd_state();
+    let show_cluster_argocd = cluster_argocd_state == ClusterArgoCdState::Present;
+    let namespaces_loaded = app.table_loaded_for(ResourceTab::Namespaces);
+    let nodes_loaded = app.table_loaded_for(ResourceTab::Nodes);
+    let pods_loaded = app.table_loaded_for(ResourceTab::Pods);
+    let crds_loaded = app.table_loaded_for(ResourceTab::CustomResources);
+    let argo_apps_loaded = app.table_loaded_for(ResourceTab::ArgoCdApps);
+    let argo_resources_loaded = app.table_loaded_for(ResourceTab::ArgoCdResources);
+    let argocd_selection = current_argocd_selection(app);
+    let argo_state = if app.table_has_error_for(ResourceTab::ArgoCdApps) {
+        "warn"
+    } else if !argo_apps_loaded {
+        "loading"
+    } else if argo_server == "-" {
         "disconnected"
     } else {
         "connected"
     };
+    let tool_total = app.host_tool_count();
+    let tool_available = app.host_tool_available_count();
+    let pending_tools = app.host_tool_pending_count();
+    let tools_state = if pending_tools > 0 {
+        "loading"
+    } else if tool_available == tool_total {
+        "ready"
+    } else {
+        "warn"
+    };
+    let tools_value = if tool_total == 0 {
+        "-".to_string()
+    } else if pending_tools > 0 {
+        format!("{pending_tools} pending")
+    } else {
+        format!("{tool_available}/{tool_total}")
+    };
+    let tools_detail = if pending_tools > 0 {
+        format!(
+            "Host toolchain inventory on {} ({pending_tools} probes in progress).",
+            app.host_name()
+        )
+    } else {
+        format!(
+            "Host toolchain inventory on {} ({tool_available}/{tool_total} available).",
+            app.host_name()
+        )
+    };
+    let namespaces_state = if app.table_has_error_for(ResourceTab::Namespaces) {
+        "warn"
+    } else if namespaces_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let nodes_state = if app.table_has_error_for(ResourceTab::Nodes) {
+        "warn"
+    } else if nodes_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let pods_state = if app.table_has_error_for(ResourceTab::Pods) {
+        "warn"
+    } else if pods_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let crds_state = if app.table_has_error_for(ResourceTab::CustomResources) {
+        "warn"
+    } else if crds_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let k8s_state = if app.table_has_error_for(ResourceTab::Namespaces)
+        || app.table_has_error_for(ResourceTab::Nodes)
+        || app.table_has_error_for(ResourceTab::Pods)
+        || app.table_has_error_for(ResourceTab::CustomResources)
+    {
+        "warn"
+    } else if namespaces_loaded && nodes_loaded && pods_loaded && crds_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let argo_domain = if !argo_apps_loaded && argo_server == "-" {
+        "pending".to_string()
+    } else {
+        compact_label(argo_server, 22)
+    };
+    let argo_apps_value = if argo_apps_loaded {
+        argo_apps.to_string()
+    } else {
+        "pending".to_string()
+    };
+    let argo_apps_state = if app.table_has_error_for(ResourceTab::ArgoCdApps) {
+        "warn"
+    } else if argo_apps_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let argo_resources_value = if argocd_selection.is_some() {
+        if argo_resources_loaded {
+            argo_resources.to_string()
+        } else {
+            "pending".to_string()
+        }
+    } else {
+        "-".to_string()
+    };
+    let argo_resources_state = if app.table_has_error_for(ResourceTab::ArgoCdResources) {
+        "warn"
+    } else if argocd_selection.is_none() {
+        "idle"
+    } else if argo_resources_loaded {
+        "ok"
+    } else {
+        "loading"
+    };
+    let crd_tree_label = if show_cluster_argocd {
+        "│ ├─󰚜 CRDs".to_string()
+    } else {
+        "│ └─󰚜 CRDs".to_string()
+    };
 
-    let rows = vec![
+    let mut rows = vec![
         RowData {
             name: "orca".to_string(),
             namespace: None,
@@ -2400,11 +3106,7 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
                 "├─󱃾 Kubernetes".to_string(),
                 "fleet".to_string(),
                 k8s_clusters.max(1).to_string(),
-                if app.table_has_error_for(ResourceTab::Pods) {
-                    "warn".to_string()
-                } else {
-                    "ok".to_string()
-                },
+                k8s_state.to_string(),
             ],
             detail: "Kubernetes estates under ORCA control".to_string(),
         },
@@ -2447,12 +3149,12 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             columns: vec![
                 "│ ├─󰉖 Namespaces".to_string(),
                 "runtime".to_string(),
-                ns_count.to_string(),
-                if app.table_has_error_for(ResourceTab::Namespaces) {
-                    "warn".to_string()
+                if namespaces_loaded {
+                    ns_count.to_string()
                 } else {
-                    "ok".to_string()
+                    "pending".to_string()
                 },
+                namespaces_state.to_string(),
             ],
             detail: "Current namespace inventory".to_string(),
         },
@@ -2462,12 +3164,12 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             columns: vec![
                 "│ ├─󰣇 Nodes".to_string(),
                 "runtime".to_string(),
-                node_count.to_string(),
-                if app.table_has_error_for(ResourceTab::Nodes) {
-                    "warn".to_string()
+                if nodes_loaded {
+                    node_count.to_string()
                 } else {
-                    "ok".to_string()
+                    "pending".to_string()
                 },
+                nodes_state.to_string(),
             ],
             detail: "Current node inventory".to_string(),
         },
@@ -2477,141 +3179,141 @@ fn build_orca_dashboard_table(app: &App) -> TableData {
             columns: vec![
                 "│ ├─󰋊 Pods".to_string(),
                 "runtime".to_string(),
-                pod_count.to_string(),
-                if app.table_has_error_for(ResourceTab::Pods) {
-                    "warn".to_string()
+                if pods_loaded {
+                    pod_count.to_string()
                 } else {
-                    "ok".to_string()
+                    "pending".to_string()
                 },
+                pods_state.to_string(),
             ],
             detail: "Current pod inventory".to_string(),
         },
         RowData {
-            name: "argocd".to_string(),
+            name: "k8s/crd".to_string(),
             namespace: None,
             columns: vec![
-                "│ └─󰀶 ArgoCD".to_string(),
-                compact_label(argo_server, 22),
-                argo_apps.to_string(),
-                argo_state.to_string(),
-            ],
-            detail: "Argo CD application delivery surface".to_string(),
-        },
-        RowData {
-            name: "argocd/apps".to_string(),
-            namespace: None,
-            columns: vec![
-                "│   ├─󰠱 Applications".to_string(),
+                crd_tree_label,
                 "runtime".to_string(),
-                argo_apps.to_string(),
-                if app.table_has_error_for(ResourceTab::ArgoCdApps) {
-                    "warn".to_string()
+                if crds_loaded {
+                    crd_count.to_string()
                 } else {
-                    "ok".to_string()
+                    "pending".to_string()
                 },
+                crds_state.to_string(),
             ],
-            detail: "Argo CD app catalog".to_string(),
+            detail: if crds_loaded {
+                format!("Custom resource definitions discovered in cluster ({crd_count} CRDs).")
+            } else {
+                "Custom resource inventory is still loading.".to_string()
+            },
         },
         RowData {
-            name: "argocd/resources".to_string(),
+            name: "tools".to_string(),
             namespace: None,
             columns: vec![
-                "│   └─󰛀 Resources".to_string(),
-                "runtime".to_string(),
-                argo_resources.to_string(),
-                if app.table_has_error_for(ResourceTab::ArgoCdResources) {
-                    "warn".to_string()
-                } else {
-                    "ok".to_string()
-                },
+                "└─󰠧 Tools".to_string(),
+                "host".to_string(),
+                tools_value,
+                tools_state.to_string(),
             ],
-            detail: "Argo CD managed resource graph".to_string(),
-        },
-        RowData {
-            name: "services".to_string(),
-            namespace: None,
-            columns: vec![
-                "└─󰠧 Services".to_string(),
-                "tooling".to_string(),
-                "6".to_string(),
-                "mapped".to_string(),
-            ],
-            detail: "Operations services exposed in ORCA".to_string(),
-        },
-        RowData {
-            name: "service/helm".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󰠰 Helm".to_string(),
-                "ops".to_string(),
-                "-".to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Helm release management".to_string(),
-        },
-        RowData {
-            name: "service/terraform".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󱁢 Terraform".to_string(),
-                "ops".to_string(),
-                "-".to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Terraform insights and plans".to_string(),
-        },
-        RowData {
-            name: "service/ansible".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󱂚 Ansible".to_string(),
-                "ops".to_string(),
-                "-".to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Ansible execution catalog".to_string(),
-        },
-        RowData {
-            name: "service/docker".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󰡨 Docker".to_string(),
-                "ops".to_string(),
-                "-".to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Container runtime inspection".to_string(),
-        },
-        RowData {
-            name: "service/git".to_string(),
-            namespace: None,
-            columns: vec![
-                "  ├─󰊤 Git".to_string(),
-                "ops".to_string(),
-                "-".to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Repository catalog and apply workflow".to_string(),
-        },
-        RowData {
-            name: "service/crd".to_string(),
-            namespace: None,
-            columns: vec![
-                "  └─󰚜 CRD".to_string(),
-                "runtime".to_string(),
-                crd_count.to_string(),
-                "ready".to_string(),
-            ],
-            detail: "Custom resources discovered in cluster".to_string(),
+            detail: tools_detail,
         },
     ];
+
+    if show_cluster_argocd {
+        rows.insert(
+            rows.len().saturating_sub(1),
+            RowData {
+                name: "argocd".to_string(),
+                namespace: None,
+                columns: vec![
+                    "│ └─󰀶 Argo CD".to_string(),
+                    argo_domain,
+                    argo_apps_value.clone(),
+                    argo_state.to_string(),
+                ],
+                detail: "Argo CD application delivery surface for this cluster".to_string(),
+            },
+        );
+        rows.insert(
+            rows.len().saturating_sub(1),
+            RowData {
+                name: "argocd/apps".to_string(),
+                namespace: None,
+                columns: vec![
+                    "│   ├─󰠱 Applications".to_string(),
+                    "runtime".to_string(),
+                    argo_apps_value,
+                    argo_apps_state.to_string(),
+                ],
+                detail: "Argo CD app catalog for the active cluster".to_string(),
+            },
+        );
+        rows.insert(
+            rows.len().saturating_sub(1),
+            RowData {
+                name: "argocd/resources".to_string(),
+                namespace: None,
+                columns: vec![
+                    "│   └─󰛀 Resources".to_string(),
+                    "runtime".to_string(),
+                    argo_resources_value,
+                    argo_resources_state.to_string(),
+                ],
+                detail: if let Some(app_name) = argocd_selection {
+                    format!("Argo CD managed resource graph for {app_name}")
+                } else {
+                    "Select an Argo CD app to inspect managed resources.".to_string()
+                },
+            },
+        );
+    }
+
+    for (index, tool) in app.host_tools().iter().enumerate() {
+        let branch = if index + 1 == tool_total {
+            "  └─"
+        } else {
+            "  ├─"
+        };
+        let state = if tool.summary == "probe pending" {
+            "loading"
+        } else if tool.available {
+            "ready"
+        } else {
+            "missing"
+        };
+        let value = if tool.summary == "probe pending" {
+            "pending".to_string()
+        } else if tool.available {
+            compact_label(&tool.summary, 18)
+        } else {
+            "-".to_string()
+        };
+        rows.push(RowData {
+            name: format!("tool/{}", tool.key),
+            namespace: None,
+            columns: vec![
+                format!("{branch}{} {}", tool.icon, tool.label),
+                tool.command.clone(),
+                value,
+                state.to_string(),
+            ],
+            detail: format!(
+                "{}\nstatus: {}\ncommand: {}\nsummary: {}",
+                tool.label,
+                if tool.available { "available" } else { state },
+                tool.command,
+                tool.summary
+            ),
+        });
+    }
 
     let mut table = TableData::default();
     table.set_rows(
         vec![
             "Tree".to_string(),
             "Domain".to_string(),
-            "Count".to_string(),
+            "Value".to_string(),
             "State".to_string(),
         ],
         rows,
@@ -2636,81 +3338,6 @@ fn compact_label(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     out.push('…');
     out
-}
-
-async fn refresh_argocd_tab(app: &mut App, tab: ResourceTab) {
-    if let Some(server) = fetch_argocd_server().await {
-        app.set_argocd_server(server);
-    }
-
-    match tab {
-        ResourceTab::ArgoCdApps => match fetch_argocd_apps_table().await {
-            Ok(table) => {
-                app.set_active_table_data(tab, table);
-                if let Some(selected_app) = app.selected_row_name_for(ResourceTab::ArgoCdApps) {
-                    app.set_argocd_selected_app(Some(selected_app));
-                }
-            }
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdResources => {
-            let selected_app = app
-                .argocd_selected_app()
-                .map(str::to_string)
-                .or_else(|| app.selected_row_name_for(ResourceTab::ArgoCdApps));
-            app.set_argocd_selected_app(selected_app.clone());
-
-            let Some(app_name) = selected_app else {
-                let mut table = TableData::default();
-                table.set_rows(
-                    vec![
-                        "Kind".to_string(),
-                        "Namespace".to_string(),
-                        "Name".to_string(),
-                        "Sync".to_string(),
-                        "Health".to_string(),
-                        "Hook".to_string(),
-                        "Wave".to_string(),
-                    ],
-                    Vec::new(),
-                    Local::now(),
-                );
-                app.set_active_table_data(tab, table);
-                app.set_status("Select an Argo CD app first (Enter on ArgoApps)");
-                return;
-            };
-
-            match fetch_argocd_resources_table(&app_name).await {
-                Ok(table) => app.set_active_table_data(tab, table),
-                Err(error) => app.set_active_tab_error(tab, error),
-            }
-        }
-        ResourceTab::ArgoCdProjects => match fetch_argocd_projects_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdRepos => match fetch_argocd_repos_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdClusters => match fetch_argocd_clusters_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdAccounts => match fetch_argocd_accounts_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdCerts => match fetch_argocd_certs_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        ResourceTab::ArgoCdGpgKeys => match fetch_argocd_gpg_table().await {
-            Ok(table) => app.set_active_table_data(tab, table),
-            Err(error) => app.set_active_tab_error(tab, error),
-        },
-        _ => {}
-    }
 }
 
 async fn fetch_argocd_server() -> Option<String> {
@@ -4019,14 +4646,6 @@ fn short_repo_label(repo: &str) -> String {
     }
 }
 
-async fn refresh_custom_resource_catalog(app: &mut App, gateway: &KubeGateway) {
-    match timeout(CRD_DISCOVERY_TIMEOUT, gateway.discover_custom_resources()).await {
-        Ok(Ok(crds)) => app.set_custom_resources(crds),
-        Ok(Err(error)) => app.set_status(format!("CRD discovery failed: {error:#}")),
-        Err(_) => app.set_status("CRD discovery timed out (using cached)"),
-    }
-}
-
 async fn run_kubectl_exec(namespace: &str, pod_name: &str, command: &[String]) -> Result<String> {
     let mut cmd = TokioCommand::new("kubectl");
     cmd.arg("exec")
@@ -4555,4 +5174,166 @@ fn compact_error(error: &anyhow::Error) -> String {
     }
 
     out.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loaded_table(headers: &[&str], rows: Vec<RowData>) -> TableData {
+        let mut table = TableData::default();
+        table.set_rows(
+            headers.iter().map(|value| (*value).to_string()).collect(),
+            rows,
+            Local::now(),
+        );
+        table
+    }
+
+    fn tool(
+        key: &str,
+        label: &str,
+        command: &str,
+        available: bool,
+        summary: &str,
+    ) -> HostToolStatus {
+        HostToolStatus {
+            key: key.to_string(),
+            label: label.to_string(),
+            icon: "󰠧".to_string(),
+            command: command.to_string(),
+            available,
+            summary: summary.to_string(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_dashboard_ready_after_core_data_without_waiting_for_argocd() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_host_tools_silent(vec![
+            tool("kubectl", "Kubectl", "kubectl", true, "v1.30.0"),
+            tool("argocd", "Argo CD CLI", "argocd", false, "not installed"),
+        ]);
+        app.set_active_table_data_silent(
+            ResourceTab::Namespaces,
+            loaded_table(&["Name"], Vec::new()),
+        );
+        app.set_active_table_data_silent(ResourceTab::Nodes, loaded_table(&["Name"], Vec::new()));
+        app.set_active_table_data_silent(ResourceTab::Pods, loaded_table(&["Name"], Vec::new()));
+        app.set_active_table_data_silent(
+            ResourceTab::CustomResources,
+            loaded_table(&["Name"], Vec::new()),
+        );
+
+        assert!(bootstrap_dashboard_ready(&app));
+        assert!(!app.table_loaded_for(ResourceTab::ArgoCdApps));
+    }
+
+    #[test]
+    fn orca_dashboard_uses_tools_branch_and_keeps_missing_tools_visible() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_host_identity("rootster", "archibald", "192.168.1.10");
+        app.set_host_tools_silent(vec![
+            tool("kubectl", "Kubectl", "kubectl", true, "v1.30.0"),
+            tool("argocd", "Argo CD CLI", "argocd", false, "not installed"),
+        ]);
+
+        let table = build_orca_dashboard_table(&app);
+        assert_eq!(
+            table.headers,
+            vec![
+                "Tree".to_string(),
+                "Domain".to_string(),
+                "Value".to_string(),
+                "State".to_string()
+            ]
+        );
+
+        let tools_row = table.rows.iter().find(|row| row.name == "tools").unwrap();
+        assert_eq!(tools_row.columns[0], "└─󰠧 Tools");
+        assert_eq!(tools_row.columns[1], "host");
+        assert_eq!(tools_row.columns[2], "1/2");
+        assert_eq!(tools_row.columns[3], "warn");
+
+        let kubectl_row = table
+            .rows
+            .iter()
+            .find(|row| row.name == "tool/kubectl")
+            .unwrap();
+        assert_eq!(kubectl_row.columns[3], "ready");
+
+        let argocd_row = table
+            .rows
+            .iter()
+            .find(|row| row.name == "tool/argocd")
+            .unwrap();
+        assert_eq!(argocd_row.columns[3], "missing");
+        assert!(table.rows.iter().all(|row| row.name != "argocd"));
+        assert!(table.rows.iter().all(|row| row.name != "services"));
+    }
+
+    #[test]
+    fn orca_dashboard_hides_cluster_argocd_until_detected() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_host_identity("rootster", "archibald", "192.168.1.10");
+        app.set_host_tools_silent(placeholder_host_tools());
+
+        let table = build_orca_dashboard_table(&app);
+
+        let crd_row = table.rows.iter().find(|row| row.name == "k8s/crd").unwrap();
+        assert_eq!(crd_row.columns[2], "pending");
+        assert_eq!(crd_row.columns[3], "loading");
+        assert!(table.rows.iter().all(|row| row.name != "argocd"));
+
+        let tools_row = table.rows.iter().find(|row| row.name == "tools").unwrap();
+        assert_eq!(
+            tools_row.columns[2],
+            format!("{} pending", app.host_tool_count())
+        );
+        assert_eq!(tools_row.columns[3], "loading");
+    }
+
+    #[test]
+    fn orca_dashboard_shows_cluster_argocd_when_argoproj_crds_exist() {
+        let mut app = App::new(
+            "cluster".to_string(),
+            "context".to_string(),
+            NamespaceScope::Named("default".to_string()),
+        );
+        app.set_host_tools_silent(placeholder_host_tools());
+        app.set_custom_resources_silent(vec![CustomResourceDef {
+            name: "applications".to_string(),
+            group: "argoproj.io".to_string(),
+            version: "v1alpha1".to_string(),
+            kind: "Application".to_string(),
+            plural: "applications".to_string(),
+            namespaced: true,
+        }]);
+
+        let table = build_orca_dashboard_table(&app);
+
+        let argocd_row = table.rows.iter().find(|row| row.name == "argocd").unwrap();
+        assert_eq!(argocd_row.columns[2], "pending");
+        assert_eq!(argocd_row.columns[3], "loading");
+
+        let apps_row = table
+            .rows
+            .iter()
+            .find(|row| row.name == "argocd/apps")
+            .unwrap();
+        assert_eq!(apps_row.columns[2], "pending");
+        assert_eq!(apps_row.columns[3], "loading");
+    }
 }
